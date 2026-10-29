@@ -140,7 +140,7 @@ def test_absolute_indirect_dispatch_switches_on_loaded_pointer():
     )
 
     assert 'absolute indirect dispatch: switch on the loaded pointer' in src
-    assert 'uint16 _target = cpu_read16(cpu, cpu->PB, (uint16)0x000e)' in src
+    assert 'uint16 _target = cpu_read16(cpu, 0x00, (uint16)0x000e)' in src
     assert 'switch (_target)' in src
     assert 'case 0x9000:' in src
     assert 'case 0x9100:' in src

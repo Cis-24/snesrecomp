@@ -1533,8 +1533,9 @@ def _emit_indirect_dispatch(insn) -> List[str]:
                 f"(uint16)(cpu->D + 0x{ptr:04x})) + 1u);"
                 "  /* PEI(dp); RTS consumes target-1 as an internal goto */")
         else:
+            # JMP (abs): the pointer lives in bank 0, the target bank is PB.
             lines.append(
-                f"  uint16 _target = cpu_read16(cpu, cpu->PB, (uint16)0x{ptr:04x});"
+                f"  uint16 _target = cpu_read16(cpu, 0x00, (uint16)0x{ptr:04x});"
                 "  /* absolute indirect dispatch: switch on the loaded pointer */")
         lines.append("  switch (_target) {")
         seen_cases = set()
@@ -1631,8 +1632,9 @@ def _emit_indirect_dispatch(insn) -> List[str]:
                 "  uint16 _target = cpu_read16(cpu, cpu->PB, _ptr);"
                 "  /* switch on the loaded pointer */")
         else:
+            # JMP (abs): the pointer lives in bank 0, the target bank is PB.
             lines.append(
-                f"  uint16 _target = cpu_read16(cpu, cpu->PB, (uint16)0x{ptr:04x});"
+                f"  uint16 _target = cpu_read16(cpu, 0x00, (uint16)0x{ptr:04x});"
                 "  /* absolute indirect dispatch: switch on the loaded pointer */"
             )
         if is_rts_stack_dispatch:

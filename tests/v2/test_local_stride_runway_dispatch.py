@@ -60,7 +60,7 @@ def test_codegen_emits_local_gotos_not_handler_calls():
     )
 
     assert 'local computed-goto dispatch' in src
-    assert 'uint16 _target = cpu_read16(cpu, cpu->PB, (uint16)0x0012)' in src
+    assert 'uint16 _target = cpu_read16(cpu, 0x00, (uint16)0x0012)' in src
     assert 'case 0x8020: goto L_8020_M1X1;' in src
     assert 'case 0x8029: goto L_8029_M1X1;' in src
     assert 'bank_00_8020_M1X1(cpu)' not in src
