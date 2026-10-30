@@ -59,6 +59,30 @@ static void update_resume_pc(void) {
     s_resume_pc = resume;
 }
 
+/* The instruction at pc reads RDNMI (`lda $4210`, `bit $4210`). */
+static bool insn_reads_rdnmi(uint32_t pc) {
+  uint8_t op = snes_read(g_snes, pc);
+  if (op != 0xADu && op != 0x2Cu)
+    return false;
+  return snes_read(g_snes, pc + 1u) == 0x10u &&
+         snes_read(g_snes, pc + 2u) == 0x42u;
+}
+
+/* The instruction at pc is the `bpl` that closes such a poll. */
+static bool insn_closes_rdnmi_poll(uint32_t pc) {
+  if (snes_read(g_snes, pc) != 0x10u)
+    return false;
+  const int8_t rel = (int8_t)snes_read(g_snes, pc + 1u);
+  return insn_reads_rdnmi((pc & 0xFF0000u) | ((pc + 2u + (uint32_t)(int32_t)rel) & 0xFFFFu));
+}
+
+static void step_one_instruction(void) {
+  interp_bridge_set_master_deadline(g_cpu.master_cycles + 1u);
+  (void)interp_bridge_run_until_quiescent(&g_cpu, s_resume_pc);
+  interp_bridge_set_master_deadline(0);
+  update_resume_pc();
+}
+
 /* A cartridge coprocessor holding the CPU IRQ line. The bridge yields to this
  * scheduler the moment one is pending with I clear, so the CPU half has to
  * deliver it -- Doom chains its GSU tasks off exactly this interrupt. */
@@ -148,6 +172,18 @@ void snes_beam_frame_driver_run_frame(void) {
   /* NMITIMEN gates NMI; nothing is delivered before reset has run, since
    * there is no instruction stream to interrupt yet. */
   if (!booting && g_snes->nmiEnabled) {
+    /* RDNMI rises at V=225, a moment before the CPU takes the NMI. A guest
+     * polling $4210 reads the flag in that window, and only there if its
+     * handler acknowledges RDNMI first thing: FF6's `lda $4210 / bpl` after a
+     * sound command (EventCmd_f0/ef/f1) waits for exactly this. Parked at the
+     * boundary the poll would never run in the window and spins for good. It
+     * may be parked on either of its two instructions. */
+    if (g_snes->rdnmiPending) {
+      if (insn_closes_rdnmi_poll(s_resume_pc))
+        step_one_instruction();
+      if (insn_reads_rdnmi(s_resume_pc))
+        step_one_instruction();
+    }
     g_snes->inNmi = true;
     s_wai_halted = false;
     run_interrupt(nmi_vector(), frame_end);
