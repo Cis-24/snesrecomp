@@ -203,6 +203,100 @@ static int test_rdnmi_poll_runs_before_nmi(void) {
   return failures;
 }
 
+/* HDMA over one rendered field. Channel 0 drives WH0 ($2126) and the observer
+ * records what each line was actually drawn with. */
+#define HDMA_TABLE 0x7E0100u
+#define WH0_BASELINE 0xFFu
+static uint8_t s_line_wh0[225];
+static uint8_t s_pixels[kPpuXPixels * 4 * 225];
+
+static void observe_line(const struct Ppu *ppu, unsigned line, void *context) {
+  (void)context;
+  s_line_wh0[line] = ppu->window1left;
+}
+
+/* Field journal empty, register file at the baseline, channel programmed. */
+static void begin_field(const uint8_t *table, size_t size) {
+  Dma *dma = s_snes.dma;
+  dma_reset(dma);
+  memcpy(&s_bus[HDMA_TABLE], table, size);
+  dma_write(dma, 0x4300, 0x00);
+  dma_write(dma, 0x4301, 0x26);
+  dma_write(dma, 0x4302, (uint8_t)HDMA_TABLE);
+  dma_write(dma, 0x4303, (uint8_t)(HDMA_TABLE >> 8));
+  dma_write(dma, 0x4304, (uint8_t)(HDMA_TABLE >> 16));
+  ppu_rasterReset();
+  ppu_write(g_ppu, 0x26, WH0_BASELINE);
+  ppu_rasterBegin(g_ppu);
+}
+
+static void render_field(void) {
+  memset(s_line_wh0, 0, sizeof s_line_wh0);
+  s_snes.vPos = 225;
+  ppu_rasterFieldBoundary();
+  PpuBeginDrawing(g_ppu, s_pixels, kPpuXPixels * 4, 0);
+  snes_beam_frame_driver_draw_ppu_frame_observed(observe_line, NULL);
+}
+
+/* Two lines of $11 without repeat, then one of $22. */
+static const uint8_t kStepTable[] = {0x02, 0x11, 0x01, 0x22, 0x00};
+/* Two lines in repeat mode: $33, then $44. */
+static const uint8_t kRepeatTable[] = {0x82, 0x33, 0x44, 0x00};
+
+/* Line 0's H-blank is a full step. The table's first entry shows on lines 1..N;
+ * without the decrement it kept them for N+1 and every later step came late. */
+static int test_hdma_steps_from_line_zero(void) {
+  int failures = 0;
+
+  begin_field(kStepTable, sizeof kStepTable);
+  dma_startDma(s_snes.dma, 0x01, true);
+  render_field();
+  failures += check(s_line_wh0[1] == 0x11, "step table: line 1 has the first entry");
+  failures += check(s_line_wh0[2] == 0x11, "step table: line 2 still has it");
+  failures += check(s_line_wh0[3] == 0x22, "step table: line 3 has the second entry");
+  failures += check(s_line_wh0[224] == 0x22, "step table: the last value holds");
+
+  begin_field(kRepeatTable, sizeof kRepeatTable);
+  dma_startDma(s_snes.dma, 0x01, true);
+  render_field();
+  failures += check(s_line_wh0[1] == 0x33, "repeat table: line 1 has the first byte");
+  failures += check(s_line_wh0[2] == 0x44, "repeat table: line 2 has the second byte");
+  return failures;
+}
+
+/* FF6 turns HDMA off in a raster IRQ near the bottom of each field and on again
+ * in NMI. The vblank write comes before V=0 and arms the channel for the init;
+ * read from line 1 on, it started every table two lines late. */
+static int test_hdma_armed_by_a_vblank_write(void) {
+  int failures = 0;
+
+  begin_field(kStepTable, sizeof kStepTable);
+  for (int field = 0; field < 2; field++) {
+    ppu_rasterRecord(0x420C, 230, 0x01);
+    ppu_rasterRecord(0x420C, 220, 0x00);
+    render_field();
+    failures += check(s_line_wh0[1] == 0x11, "vblank enable: line 1 has the first entry");
+    failures += check(s_line_wh0[2] == 0x11, "vblank enable: line 2 still has it");
+    failures += check(s_line_wh0[3] == 0x22, "vblank enable: line 3 has the second entry");
+    failures += check(!s_snes.dma->channel[0].hdmaActive, "the raster IRQ's disable still lands");
+  }
+  return failures;
+}
+
+/* A channel switched on part-way down the field still spends its first slot on
+ * the table header, so applying the vblank writes early must not move this. */
+static int test_hdma_mid_field_enable_keeps_its_delay(void) {
+  int failures = 0;
+
+  begin_field(kStepTable, sizeof kStepTable);
+  ppu_rasterRecord(0x420C, 21, 0x01);
+  render_field();
+  failures += check(s_line_wh0[1] == WH0_BASELINE, "mid-field enable: top of the field untouched");
+  failures += check(s_line_wh0[23] == WH0_BASELINE, "mid-field enable: first slot only loads the header");
+  failures += check(s_line_wh0[24] == 0x11, "mid-field enable: first transfer in the slot after");
+  return failures;
+}
+
 int main(void) {
   int failures = 0;
 
@@ -220,6 +314,9 @@ int main(void) {
   write_program();
 
   failures += test_rdnmi_poll_runs_before_nmi();
+  failures += test_hdma_steps_from_line_zero();
+  failures += test_hdma_armed_by_a_vblank_write();
+  failures += test_hdma_mid_field_enable_keeps_its_delay();
 
   dma_free(s_snes.dma);
   ppu_free(g_ppu);

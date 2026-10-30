@@ -30,6 +30,7 @@ extern Ppu *g_ppu;
 #define BFD_MASTER_CYCLES_PER_FIELD 357368ull
 #define BFD_MASTER_CYCLES_PER_LINE 1364u
 #define BFD_VBLANK_LINE 225u
+#define BFD_LAST_LINE 261
 
 /* Bounds the run/park loop: a field holds 262 one-line park steps plus the
  * slices and interrupts between them. Only a pathological guest reaches it. */
@@ -281,10 +282,21 @@ void snes_beam_frame_driver_draw_ppu_frame_observed(
    * the beam must not also step it from inside guest register writes. */
   snes_set_hdma_beam_enabled(g_snes, false);
   ppu_rasterRenderBegin(g_ppu);
+  /* The field's vblank writes come before V=0. A channel its NMI switches back
+   * on is armed when the init runs: FF6 turns HDMA off in a raster IRQ near the
+   * bottom of each field and on again in NMI, and applying that from line 1
+   * started every table two lines late. */
+  {
+    uint8_t hdmaen;
+    ppu_rasterApplyLine(g_ppu, BFD_LAST_LINE);
+    if (ppu_rasterTakeHdmaen(&hdmaen))
+      dma_startDma(g_snes->dma, hdmaen, true);
+  }
   dma_initHdma(g_snes->dma);
-  /* Hardware's V=0 init also performs each channel's first transfer before
-   * any visible pixel. */
-  dma_primeHdmaFirstLine(g_snes->dma);
+  /* Line 0's H-blank: a full HDMA step before the first visible line, not only
+   * its transfer. Without the decrement a table whose first entry runs N lines
+   * keeps it for N+1, and every later step lands a line late. */
+  dma_doHdma(g_snes->dma);
   for (line = 1; line <= 224; line++) {
     uint8_t hdmaen;
     /* A split is written in H-blank after its line is drawn, so the previous
