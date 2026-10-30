@@ -822,17 +822,19 @@ static void PpuRunLineJob(Ppu* ppu, int line, bool pixels, bool live) {
     s_oam_snap_frame = snes_frame_counter;
     debug_server_on_oam_render();
   }
-  if(line == 0) {
-    if (PPU_mosaicSize(ppu) != ppu->lastMosaicModulo) {
-      int mod = PPU_mosaicSize(ppu);
-      ppu->lastMosaicModulo = mod;
-      for (int i = 0, j = 0; i < countof(ppu->mosaicModulo); i++) {
-        ppu->mosaicModulo[i] = i - j;
-        j = (j + 1 == mod ? 0 : j + 1);
-      }
+  /* Per line, not in the line == 0 block: frame-model hosts render lines
+   * 1..224 and would never build the table, and a guest can change the size on
+   * any line (FF6 drives $2106 by HDMA). With an empty table the mosaic span
+   * width goes negative and the draw loop runs off the buffer. */
+  if (PPU_mosaicSize(ppu) != ppu->lastMosaicModulo) {
+    int mod = PPU_mosaicSize(ppu);
+    ppu->lastMosaicModulo = mod;
+    for (int i = 0, j = 0; i < countof(ppu->mosaicModulo); i++) {
+      ppu->mosaicModulo[i] = i - j;
+      j = (j + 1 == mod ? 0 : j + 1);
     }
-
-
+  }
+  if(line == 0) {
     // pre-render line
     // TODO: this now happens halfway into the first line
     ppu->mosaicStartLine = 1;
