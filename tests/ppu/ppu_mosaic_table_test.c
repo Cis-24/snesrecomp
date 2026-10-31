@@ -83,7 +83,7 @@ static void setup_solid_bg1(Ppu *ppu, bool layer_on) {
 
 int main(void) {
     enum { kPitch = kPpuXPixels * 4 };
-    static uint8_t pixels[kPitch * 4];
+    static uint8_t pixels[kPitch * 8];
     Ppu *ppu = ppu_init();
     int failures = 0;
     if (!ppu) return 2;
@@ -119,6 +119,34 @@ int main(void) {
         if (p[0] != 0 || p[1] != 0 || p[2] != want_red) span_ok = false;
     }
     failures += check(span_ok, "a mosaic BG behind a window fills its span and only that");
+
+    /* The vertical block counts from the first visible line. Tile 1 has one
+     * colour per row, so each drawn line names the row it was sampled from:
+     * with size 4, lines 1-4 show row 1 and lines 5-8 row 5. */
+    setup_solid_bg1(ppu, true);
+    ppu_write(ppu, 0x06, 0x31);
+    for (int row = 0; row < 8; row++) {
+        const int color = row + 1;
+        uint16_t lo = 0, hi = 0;
+        if (color & 1) lo |= 0x00ff;
+        if (color & 2) lo |= 0xff00;
+        if (color & 4) hi |= 0x00ff;
+        if (color & 8) hi |= 0xff00;
+        ppu->vram[0x1000 + 16 + row] = lo;
+        ppu->vram[0x1000 + 16 + 8 + row] = hi;
+        ppu->cgram[color] = (uint16_t)(color * 3);
+    }
+    memset(pixels, 0, sizeof pixels);
+    PpuBeginDrawing(ppu, pixels, kPitch, kPpuRenderFlags_NewRenderer);
+    bool blocks_ok = true;
+    for (int line = 1; line <= 8; line++) {
+        ppu_runLine(ppu, line);
+        const int row = line <= 4 ? 1 : 5;
+        const uint8_t *p = pixels + (size_t)(line - 1) * kPitch;
+        const uint8_t want = ppu->brightnessMult[(row + 1) * 3];
+        if (p[2] != want) blocks_ok = false;
+    }
+    failures += check(blocks_ok, "vertical mosaic blocks start at line 1");
 
     ppu_free(ppu);
     if (failures) {

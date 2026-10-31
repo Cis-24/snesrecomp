@@ -707,6 +707,12 @@ static inline uint8 PpuMosaicAt(Ppu *ppu, int i) {
   return ppu->mosaicModulo[(unsigned)i < (unsigned)kPpuXPixels ? i : (i < 0 ? 0 : kPpuXPixels - 1)];
 }
 
+// The vertical block counts from the first visible line, not from line 0: with
+// size 4, lines 1-4 show line 1's row and lines 5-8 line 5's.
+static inline int PpuMosaicLine(const Ppu *ppu, int y) {
+  return y > 0 ? ppu->mosaicModulo[y - 1] + 1 : y;
+}
+
 /* Frame of the last OAM ring snapshot; see the note in ppu_runLine. Debug
  * instrumentation only -- it never affects rendering. */
 static int s_oam_snap_frame = -1;
@@ -1331,7 +1337,7 @@ static void PpuDrawBackgroundBig(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y,
   PpuWindows win;
   IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer, y)
                                       : PpuWindows_Clear(&win, ppu, layer, y);
-  const int sy = (int)(mosaic ? ppu->mosaicModulo[y] : y) + ppu->vScroll[layer];
+  const int sy = (mosaic ? PpuMosaicLine(ppu, y) : y) + ppu->vScroll[layer];
   const int tileadr = PPU_bgTileAdr(ppu, layer);
   const int words = (bpp == 4) ? 16 : 8;          /* vram words per 8x8 char */
   const unsigned pal_shift = (bpp == 4) ? 6 : 8;
@@ -1740,7 +1746,7 @@ static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu,
     return;  // layer is completely hidden
   PpuWindows win;
   IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer, y) : PpuWindows_Clear(&win, ppu, layer, y);
-  y = ppu->mosaicModulo[y] + ppu->vScroll[layer];
+  y = PpuMosaicLine(ppu, y) + ppu->vScroll[layer];
   int sc_offs = PPU_bgTilemapAdr(ppu, layer) + (((y >> 3) & 0x1f) << 5);
   if ((y & 0x100) && PPU_bgTilemapHigher(ppu, layer))
     sc_offs += PPU_bgTilemapWider(ppu, layer) ? 0x800 : 0x400;
@@ -2036,7 +2042,7 @@ static void PpuDrawBackground_2bpp_mosaic(Ppu *ppu, PpuPixelPrioBufs *dstbuf, in
     return;  // layer is completely hidden
   PpuWindows win;
   IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer, y) : PpuWindows_Clear(&win, ppu, layer, y);
-  y = ppu->mosaicModulo[y] + ppu->vScroll[layer];
+  y = PpuMosaicLine(ppu, y) + ppu->vScroll[layer];
   int sc_offs = PPU_bgTilemapAdr(ppu, layer) + (((y >> 3) & 0x1f) << 5);
   if ((y & 0x100) && PPU_bgTilemapHigher(ppu, layer))
     sc_offs += PPU_bgTilemapWider(ppu, layer) ? 0x800 : 0x400;
@@ -2105,7 +2111,7 @@ static void PpuDrawBackground_mode7(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y, 
   clippedV = (clippedV & 0x2000) ? (clippedV | ~1023) : (clippedV & 1023);
   uint8 mosaic_enabled = PPU_mosaicEnabled(ppu, 0);
   if (mosaic_enabled)
-    y = ppu->mosaicModulo[y];
+    y = PpuMosaicLine(ppu, y);
   uint32 ry = PPU_m7yFlip(ppu) ? 255 - y : y;
   uint32 m7startX = (ppu->m7matrix[0] * clippedH & ~63) + (ppu->m7matrix[1] * ry & ~63) +
     (ppu->m7matrix[1] * clippedV & ~63) + (xCenter << 8);
