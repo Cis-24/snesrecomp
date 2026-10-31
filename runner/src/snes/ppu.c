@@ -12,6 +12,7 @@ extern unsigned char g_snesrecomp_last_hdmaen;
 #include <stddef.h>
 
 #include "snes.h"
+#include "dma.h"
 #include "../debug_server.h"
 #if SNESRECOMP_ENABLE_MODS
 #include "../snes_text_xlate.h"
@@ -3194,6 +3195,14 @@ uint8_t ppu_read(Ppu* ppu, uint8_t adr) {
  * unit. The set used to be the five registers one title's handlers wrote;
  * the next title wrote a sixth and drew black.
  *
+ * The DMA channel registers ($4300-$437F) are journaled for the same reason:
+ * the walk runs HDMA after the CPU half, and by then a channel may be set up
+ * for something else. FF6's raster IRQ switches HDMA off at V=215 and reuses
+ * channel 0 for a VRAM upload; read at the end of the field, the channel sent
+ * the BG2 wave table to VRAM instead of the scroll registers. The walk sees
+ * each field's baseline plus its writes in beam order, and RenderEnd puts back
+ * the registers the guest left.
+ *
  * Writes the render walk makes itself (its HDMA, and this replay) are not
  * journaled: they are the field being reconstructed, not new history. HDMA
  * the beam performs during the CPU half (a host that leaves beam HDMA on) is
@@ -3223,6 +3232,8 @@ typedef struct {
   uint8_t regs[PPU_SAVESTATE_REGS_SIZE];   /* inidisp..cgwsel at field start */
   uint8_t scrollPrev, scrollPrev2, m7prev;
   uint8_t hdmaen;
+  DmaChannel dma[8];                       /* channel registers at field start */
+  bool has_dma;
   int count;
   uint32_t dropped;
   PpuRasterEntry e[PPU_RASTER_MAX];
@@ -3236,6 +3247,9 @@ static const PpuRasterField *s_raster_render;
 static int s_raster_next;
 static uint8_t s_raster_hdmaen;
 static int s_raster_hdmaen_pending;
+static PpuRasterDmaWrite *s_raster_dma_writer;
+static DmaChannel s_raster_guest_dma[8];
+static bool s_raster_dma_saved;
 static struct {
   uint8_t oamAdr, oamInHigh, oamSecondWrite, oamBuffer;
 } s_raster_port;
@@ -3251,7 +3265,7 @@ static uint16_t raster_key(uint16_t line) {
 }
 
 static int raster_reg_journaled(uint16_t reg) {
-  if (reg == 0x420C)
+  if (reg == 0x420C || (reg >= 0x4300 && reg < 0x4380))
     return 1;
   if (reg < 0x2100 || reg > 0x2133)
     return 0;
@@ -3272,8 +3286,31 @@ static void raster_snapshot(PpuRasterField *f, const Ppu *ppu) {
   f->scrollPrev2 = ppu->scrollPrev2;
   f->m7prev = ppu->m7prev;
   f->hdmaen = g_snesrecomp_last_hdmaen;
+  f->has_dma = g_snes && g_snes->dma;
+  if (f->has_dma)
+    memcpy(f->dma, g_snes->dma->channel, sizeof(f->dma));
   f->count = 0;
   f->dropped = 0;
+}
+
+/* The channel's registers, not the walk's table state or the armed flags. */
+static void raster_dma_copy_regs(DmaChannel *dst, const DmaChannel *src) {
+  dst->bAdr = src->bAdr;
+  dst->aAdr = src->aAdr;
+  dst->aBank = src->aBank;
+  dst->size = src->size;
+  dst->indBank = src->indBank;
+  dst->unusedByte = src->unusedByte;
+  dst->mode = src->mode;
+  dst->fixed = src->fixed;
+  dst->decrement = src->decrement;
+  dst->indirect = src->indirect;
+  dst->fromB = src->fromB;
+  dst->unusedBit = src->unusedBit;
+}
+
+void ppu_rasterSetDmaWriter(PpuRasterDmaWrite *writer) {
+  s_raster_dma_writer = writer;
 }
 
 void ppu_rasterBegin(Ppu *ppu) {
@@ -3303,6 +3340,7 @@ void ppu_rasterReset(void) {
   s_raster_rendering = 0;
   s_raster_render = NULL;
   s_raster_hdmaen_pending = 0;
+  s_raster_dma_saved = false;
 }
 
 void ppu_rasterRecord(uint16_t reg, uint16_t line, uint8_t val) {
@@ -3348,6 +3386,12 @@ void ppu_rasterRenderBegin(Ppu *ppu) {
   ppu->scrollPrev = f->scrollPrev;
   ppu->scrollPrev2 = f->scrollPrev2;
   ppu->m7prev = f->m7prev;
+  if (s_raster_dma_writer && f->has_dma && g_snes && g_snes->dma) {
+    memcpy(s_raster_guest_dma, g_snes->dma->channel, sizeof(s_raster_guest_dma));
+    for (int i = 0; i < 8; i++)
+      raster_dma_copy_regs(&g_snes->dma->channel[i], &f->dma[i]);
+    s_raster_dma_saved = true;
+  }
   s_raster_render = f;
   s_raster_next = 0;
   s_raster_hdmaen_pending = 0;
@@ -3380,6 +3424,9 @@ void ppu_rasterApplyLine(Ppu *ppu, int line) {
        * owns the render loop and calls dma_initHdma/dma_doHdma. */
       s_raster_hdmaen = val;
       s_raster_hdmaen_pending = 1;
+    } else if (reg >= 0x4300 && reg < 0x4380) {
+      if (s_raster_dma_writer)
+        s_raster_dma_writer(reg, val);
     } else {
       raster_replay(ppu, reg, val);
     }
@@ -3400,8 +3447,13 @@ void ppu_rasterRenderEnd(Ppu *ppu) {
   if (s_raster_have_completed) {
     f = &s_field[s_raster_cur];
     for (i = 0; i < f->count; i++)
-      if (f->e[i].reg != 0x420C)
+      if (f->e[i].reg >= 0x2100 && f->e[i].reg <= 0x2133)
         raster_replay(ppu, f->e[i].reg, f->e[i].val);
+  }
+  if (s_raster_dma_saved) {
+    for (i = 0; i < 8; i++)
+      raster_dma_copy_regs(&g_snes->dma->channel[i], &s_raster_guest_dma[i]);
+    s_raster_dma_saved = false;
   }
   ppu->oamAdr = s_raster_port.oamAdr;
   ppu->oamInHigh = s_raster_port.oamInHigh;

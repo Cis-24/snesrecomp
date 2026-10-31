@@ -297,6 +297,53 @@ static int test_hdma_mid_field_enable_keeps_its_delay(void) {
   return failures;
 }
 
+/* A guest write to a channel register, as snes.c does it. */
+static void guest_channel_write(uint16_t line, uint16_t reg, uint8_t val) {
+  ppu_rasterRecord(reg, line, val);
+  dma_write(s_snes.dma, reg, val);
+}
+
+/* FF6's frame: NMI sets channel 0 up for HDMA and arms it, the raster IRQ at
+ * V=215 switches HDMA off and reuses the channel for a VRAM upload. The walk
+ * runs after all of it and has to see the channel as it was on each line. */
+static int test_hdma_sees_the_channel_of_its_line(void) {
+  Dma *dma = s_snes.dma;
+  int failures = 0;
+
+  begin_field(kStepTable, sizeof kStepTable);
+  for (int field = 0; field < 2; field++) {
+    guest_channel_write(230, 0x4300, 0x00);
+    guest_channel_write(230, 0x4301, 0x26);
+    ppu_rasterRecord(0x420C, 231, 0x01);
+    ppu_rasterRecord(0x420C, 215, 0x00);
+    guest_channel_write(215, 0x4300, 0x41);
+    guest_channel_write(215, 0x4301, 0x18);
+    const uint32_t vram_writes = g_ppu->vramWriteCount;
+    render_field();
+    failures += check(s_line_wh0[1] == 0x11, "reused channel: line 1 has the first entry");
+    failures += check(s_line_wh0[3] == 0x22, "reused channel: line 3 has the second entry");
+    failures += check(g_ppu->vramWriteCount == vram_writes,
+                      "reused channel: the walk does not write the VRAM port");
+    failures += check(dma->channel[0].bAdr == 0x18 && dma->channel[0].mode == 1,
+                      "the guest gets its channel registers back");
+  }
+
+  /* A split: the channel changes register on a visible line, with HDMA running.
+   * Table: 6 lines each on its own transfer. */
+  static const uint8_t kSplitTable[] = {0x86, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x00};
+  begin_field(kSplitTable, sizeof kSplitTable);
+  ppu_write(g_ppu, 0x27, WH0_BASELINE);
+  ppu_rasterRecord(0x420C, 230, 0x01);
+  guest_channel_write(2, 0x4301, 0x27);
+  guest_channel_write(150, 0x4301, 0x26);
+  render_field();
+  failures += check(s_line_wh0[3] == 0x33, "split: before it the channel still drives $2126");
+  failures += check(s_line_wh0[4] == 0x33, "split: after it $2126 keeps its value");
+  failures += check(g_ppu->window1right == 0x36, "split: the rest of the table went to $2127");
+  failures += check(dma->channel[0].bAdr == 0x26, "split: the last write is what the guest has");
+  return failures;
+}
+
 int main(void) {
   int failures = 0;
 
@@ -317,6 +364,7 @@ int main(void) {
   failures += test_hdma_steps_from_line_zero();
   failures += test_hdma_armed_by_a_vblank_write();
   failures += test_hdma_mid_field_enable_keeps_its_delay();
+  failures += test_hdma_sees_the_channel_of_its_line();
 
   dma_free(s_snes.dma);
   ppu_free(g_ppu);

@@ -273,6 +273,10 @@ void snes_beam_frame_driver_draw_ppu_frame(void) {
   snes_beam_frame_driver_draw_ppu_frame_observed(NULL, NULL);
 }
 
+static void raster_dma_write(uint16_t reg, uint8_t val) {
+  dma_write(g_snes->dma, reg, val);
+}
+
 void snes_beam_frame_driver_draw_ppu_frame_observed(
     SnesBeamRasterObserver *observer, void *context) {
   int line;
@@ -281,6 +285,7 @@ void snes_beam_frame_driver_draw_ppu_frame_observed(
    * entries and HDMA in beam order. HDMA here is the real unit (dma.c), so
    * the beam must not also step it from inside guest register writes. */
   snes_set_hdma_beam_enabled(g_snes, false);
+  ppu_rasterSetDmaWriter(raster_dma_write);
   ppu_rasterRenderBegin(g_ppu);
   /* The field's vblank writes come before V=0. A channel its NMI switches back
    * on is armed when the init runs: FF6 turns HDMA off in a raster IRQ near the

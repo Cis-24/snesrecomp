@@ -963,6 +963,7 @@ void snes_write(Snes* snes, uint32_t adr, uint8_t val) {
       snes_writeReg(snes, adr, val); // manual joypad strobe
     }
     if(adr >= 0x4300 && adr < 0x4380) {
+      ppu_rasterRecord(adr, snes->vPos, val);
       dma_write(snes->dma, adr, val); // dma registers
       /* S-DD1 spies on DMA channel register writes */
       if (snes->cart && snes->cart->type == CART_SDD1 && snes->cart->sdd1)

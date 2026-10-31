@@ -611,6 +611,12 @@ void ppu_rasterBegin(Ppu *ppu);
 void ppu_rasterRenderBegin(Ppu *ppu);
 void ppu_rasterRenderEnd(Ppu *ppu);
 int  ppu_rasterTakeHdmaen(uint8_t *out);
+/* DMA channel registers ($4300-$437F) are journaled too: HDMA runs in the
+ * render walk, so it has to see them as they stood on each line. The host that
+ * owns the DMA unit names the function that applies one write; until it does,
+ * they are recorded and ignored. */
+typedef void PpuRasterDmaWrite(uint16_t reg, uint8_t val);
+void ppu_rasterSetDmaWriter(PpuRasterDmaWrite *writer);
 void ppu_rasterRecord(uint16_t reg, uint16_t line, uint8_t val);
 void ppu_rasterApplyLine(Ppu *ppu, int line);
 /* Called by the beam walk when it reaches V=225. */

@@ -1653,6 +1653,7 @@ void WriteReg(uint16 reg, uint8 value) {
       g_memsel = (uint8_t)(value & 1);  /* FastROM select; paces $80-FF code */
     recomp_write_internal_reg(reg, value);
   } else if (reg >= 0x4300 && reg < 0x4380) {
+    ppu_rasterRecord(reg, g_snes->vPos, value);
     dma_write(g_dma, reg, value);
   } else if (reg >= 0x4800 && reg < 0x4808 &&
              g_snes && g_snes->cart &&
