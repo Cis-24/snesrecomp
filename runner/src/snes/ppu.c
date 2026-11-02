@@ -3449,6 +3449,9 @@ void ppu_rasterRenderEnd(Ppu *ppu) {
   PpuRasterField *f;
   int i;
   if (!s_raster_armed || !s_raster_rendering) return;
+  /* The loop stops at the last drawn line; what the field wrote on it has not
+   * been applied and only shows from the next field on. */
+  ppu_rasterApplyLine(ppu, 224);
   s_raster_rendering = 0;
   if (s_raster_have_completed) {
     f = &s_field[s_raster_cur];

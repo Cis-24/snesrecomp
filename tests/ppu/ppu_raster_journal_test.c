@@ -98,6 +98,28 @@ int main(void) {
   CHECK(p.window1left == 0x20);
   ppu_rasterRenderEnd(&p);
 
+  /* A write on the last drawn line shows from the next field on, and has to be
+   * in that field's baseline: FF6's menu sets BG1SC there, nothing writes it
+   * again, and a baseline taken from the walk's end without it kept the old
+   * screen size for good. */
+  ppu_rasterReset();
+  write_at(225, 0x26, 0x10);
+  ppu_rasterBegin(&p);
+  write_at(224, 0x26, 0x44);
+  s_snes.vPos = 225;
+  ppu_rasterFieldBoundary();
+  ppu_rasterRenderBegin(&p);
+  ppu_rasterApplyLine(&p, 223);
+  CHECK(p.window1left == 0x10);
+  ppu_rasterRenderEnd(&p);
+  CHECK(p.window1left == 0x44);
+  s_snes.vPos = 225;
+  ppu_rasterFieldBoundary();
+  ppu_rasterRenderBegin(&p);
+  CHECK(p.window1left == 0x44);
+  ppu_rasterRenderEnd(&p);
+  CHECK(p.window1left == 0x44);
+
   /* A machine reset disarms. */
   ppu_rasterReset();
   write_at(50, 0x26, 0x77);
