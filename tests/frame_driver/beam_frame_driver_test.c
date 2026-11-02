@@ -344,6 +344,28 @@ static int test_hdma_sees_the_channel_of_its_line(void) {
   return failures;
 }
 
+/* FF6's main menu drives TM by HDMA and then switches the channel off; nobody
+ * writes TM again. The register holds what HDMA left, on every later field. The
+ * baseline used to be taken at V=225, before the walk ran that field's HDMA, and
+ * from then on two baselines took turns: every other frame of the menu drew
+ * black, with no write to show for it. */
+static int test_hdma_value_survives_into_later_fields(void) {
+  int failures = 0;
+
+  begin_field(kStepTable, sizeof kStepTable);
+  ppu_rasterRecord(0x420C, 230, 0x01);
+  render_field();
+  failures += check(s_line_wh0[224] == 0x22, "hdma only: the table's last value holds");
+  ppu_rasterRecord(0x420C, 230, 0x00);
+  for (int field = 0; field < 5; field++) {
+    render_field();
+    failures += check(s_line_wh0[1] == 0x22, "hdma only: the next field starts with that value");
+    failures += check(s_line_wh0[224] == 0x22, "hdma only: and keeps it");
+    failures += check(g_ppu->window1left == 0x22, "hdma only: the guest's register file has it too");
+  }
+  return failures;
+}
+
 int main(void) {
   int failures = 0;
 
@@ -365,6 +387,7 @@ int main(void) {
   failures += test_hdma_armed_by_a_vblank_write();
   failures += test_hdma_mid_field_enable_keeps_its_delay();
   failures += test_hdma_sees_the_channel_of_its_line();
+  failures += test_hdma_value_survives_into_later_fields();
 
   dma_free(s_snes.dma);
   ppu_free(g_ppu);

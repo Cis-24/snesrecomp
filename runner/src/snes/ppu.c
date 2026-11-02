@@ -3446,12 +3446,21 @@ void ppu_rasterApplyLine(Ppu *ppu, int line) {
  * register file it last wrote. The OAM port is the guest's, not display
  * state: an OAMADD replay must not move it. */
 void ppu_rasterRenderEnd(Ppu *ppu) {
-  const PpuRasterField *f;
+  PpuRasterField *f;
   int i;
   if (!s_raster_armed || !s_raster_rendering) return;
   s_raster_rendering = 0;
   if (s_raster_have_completed) {
     f = &s_field[s_raster_cur];
+    /* The walk has just reached V=225 of the completed field, HDMA included.
+     * That is the recording field's true baseline: the snapshot at the boundary
+     * ran before this HDMA. Keeping it makes a register only HDMA writes
+     * alternate between two baselines for good (FF6 menu: HDMA leaves TM $00 or
+     * $17, then no one writes it again and every other frame draws black). */
+    memcpy(f->regs, &ppu->inidisp, PPU_SAVESTATE_REGS_SIZE);
+    f->scrollPrev = ppu->scrollPrev;
+    f->scrollPrev2 = ppu->scrollPrev2;
+    f->m7prev = ppu->m7prev;
     for (i = 0; i < f->count; i++)
       if (f->e[i].reg >= 0x2100 && f->e[i].reg <= 0x2133)
         raster_replay(ppu, f->e[i].reg, f->e[i].val);
