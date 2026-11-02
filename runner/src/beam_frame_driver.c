@@ -168,6 +168,7 @@ void snes_beam_frame_driver_run_frame(void) {
    * comparator. Re-asserted per frame: a save-state load restores Snes. */
   snes_set_hdma_beam_enabled(g_snes, false);
   snes_set_raster_irq_beam_enabled(true);
+  snes_set_beam_on_master_clock(true);
   ppu_rasterBegin(g_ppu);
 
   /* NMITIMEN gates NMI; nothing is delivered before reset has run, since

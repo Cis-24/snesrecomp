@@ -55,6 +55,14 @@ int main(void) {
     }
   }
   s.rdnmiPending=true;snes_reset(&s,false);assert(!s.rdnmiPending);
+  /* HVBJOY: the polling tick is for hosts with no beam of their own. On one that
+   * follows the master clock it would move hPos/vPos ahead of beamMasterLast. */
+  s.hPos=100;s.vPos=10;
+  snes_set_beam_on_master_clock(false);
+  (void)snes_readReg(&s,0x4212);assert(s.hPos==164 && s.vPos==10);
+  snes_set_beam_on_master_clock(true);
+  (void)snes_readReg(&s,0x4212);assert(s.hPos==164 && s.vPos==10);
+  snes_set_beam_on_master_clock(false);
   puts("RDNMI: disabled/enabled NMI, read-clear, field expiry, instance isolation, host compatibility, v9/v10 snapshots and reset PASS");
   return 0;
 }

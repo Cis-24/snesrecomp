@@ -73,6 +73,14 @@ void snes_set_raster_irq_beam_enabled(bool enabled) {
   s_raster_irq_beam_off = !enabled;
 }
 
+static bool s_beam_on_master_clock;
+void snes_set_beam_on_master_clock(bool enabled) {
+  s_beam_on_master_clock = enabled;
+}
+bool snes_beam_on_master_clock(void) {
+  return s_beam_on_master_clock;
+}
+
 static SnesMasterClockChargeHook s_master_clock_charge_hook;
 static SnesWramWriteLogHook s_wram_write_log_hook;
 
@@ -648,9 +656,14 @@ uint8_t snes_readReg(Snes* snes, uint16_t adr) {
       /* Whole-program interpreter runs already advance the beam from every
        * opcode's measured master clocks. Applying the legacy static-recomp
        * polling tick as well doubles time in $4212 wait loops (SMRPG's boot
-       * fades completed in half the reference frame count). */
+       * fades completed in half the reference frame count).
+       * Nor on a beam that follows the master clock: the read path has just
+       * synced it, and the tick moves hPos/vPos without beamMasterLast. FF6's
+       * menus wait for H-blank some 60 times a frame in compiled code, and the
+       * next V=225 by the clock came up to three lines into vblank by the beam:
+       * NMI ran that late and its HDMA enable slid past V=0. */
       extern int g_interp_apu_driving;
-      if (!g_interp_apu_driving)
+      if (!g_interp_apu_driving && !s_beam_on_master_clock)
         snes_advance_beam(snes, 64, false);
       // Bit 7 = vblank. The real frame loop drives vblank via inNmi, not
       // inVblank (inVblank is never set true), so on the static-recomp

@@ -50,6 +50,8 @@ void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
 void snes_refresh_exempt(void) {}
 void snes_set_hdma_beam_enabled(Snes *snes, bool enabled) { (void)snes; (void)enabled; }
 void snes_set_raster_irq_beam_enabled(bool enabled) { (void)enabled; }
+static bool s_beam_on_master_clock;
+void snes_set_beam_on_master_clock(bool enabled) { s_beam_on_master_clock = enabled; }
 uint32_t snes_master_clocks_until_irq(const Snes *snes) { (void)snes; return 0; }
 uint32_t snes_master_clocks_until_line(const Snes *snes, uint32_t line) {
   (void)snes; (void)line; return 0;
@@ -170,6 +172,7 @@ static int test_rdnmi_poll_runs_before_nmi(void) {
   int failures = 0;
 
   run_nmi_frame(POLL_LDA, true, true);
+  failures += check(s_beam_on_master_clock, "the driver's beam follows the master clock");
   failures += check(s_nmis == 1, "parked on lda: NMI still delivered");
   failures += check(s_poll_saw_flag, "parked on lda: the poll reads the flag before the NMI");
   failures += check(s_steps == 1, "parked on lda: one instruction runs");
