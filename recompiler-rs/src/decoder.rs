@@ -457,6 +457,49 @@ fn is_long_dispatch(insn: &Insn, table_bases: &[u32]) -> bool {
     insn.opcode == 0xDC || insn.length == 4 || table_bases.len() == 3
 }
 
+/// True when a short `JMP (abs)` / `JMP (abs,X)` tail dispatch must keep its
+/// targets inside the current function because its path holds a PHP. Port of
+/// `_held_php_dispatch_stays_local`. Only plain tail transfers qualify (no
+/// pointer call, no popped call frame, no long JML), and every target has to
+/// be a ROM label in this bank; otherwise the site keeps its tail calls.
+#[allow(clippy::too_many_arguments)]
+fn held_php_dispatch_stays_local(
+    insn: &Insn,
+    key: &DecodeKey,
+    bank: u32,
+    entries: &[u32],
+    mapping: RomMapping,
+    reloc: &[RelocRegion],
+    ptr_call: bool,
+    popped_call_frame: bool,
+) -> bool {
+    if key.p_stack.is_empty() || ptr_call || popped_call_frame {
+        return false;
+    }
+    if insn.mnem != "JMP" || !(insn.mode == Mode::Indir || insn.mode == Mode::IndirX) {
+        return false;
+    }
+    if insn.dispatch_kind.as_deref() != Some("short") {
+        return false;
+    }
+    let mut any = false;
+    for &e in entries {
+        if e == 0 {
+            continue;
+        }
+        any = true;
+        let eb = (e >> 16) & 0xFF;
+        let e16 = e & 0xFFFF;
+        if eb != (bank & 0xFF) {
+            return false;
+        }
+        if addr_in_reloc_region(eb, e16, reloc).is_none() && !is_rom_address(mapping, eb, e16) {
+            return false;
+        }
+    }
+    any
+}
+
 /// Walk the dispatch table for a `JMP/JML/JSR (abs,X)`. Port of
 /// `_autorecover_indirect_xtable`.
 fn autorecover_indirect_xtable(
@@ -1435,7 +1478,24 @@ pub fn decode_function(
                     } else {
                         auth.table_bases.clone()
                     };
-                    insn.dispatch_local_goto = auth.local_goto;
+                    // A tail dispatch made while this path holds a PHP stays
+                    // inside this function, like a plain jump onto a sibling
+                    // entry. Split off, each target would pop a P it never
+                    // pushed (FF6 ValidateSpellList: `PHP; LONGI; ...;
+                    // JMP (tbl,X)`, targets ending in `PLP; PLX; RTS`).
+                    // Mirrors the Python decoder.
+                    let local_goto = auth.local_goto
+                        || held_php_dispatch_stays_local(
+                            &insn,
+                            &key,
+                            bank,
+                            &entries,
+                            mapping,
+                            reloc,
+                            auth.ptr_call,
+                            auth.popped_call_frame,
+                        );
+                    insn.dispatch_local_goto = local_goto;
                     insn.dispatch_call = auth.ptr_call;
                     insn.dispatch_pointer_match = auth.pointer_match;
                     insn.dispatch_popped_call_frame = auth.popped_call_frame;
@@ -1455,6 +1515,13 @@ pub fn decode_function(
                     let site_m = insn.m_flag & 1;
                     let site_x = insn.x_flag & 1;
                     let mut extra_succs: Vec<(DecodeKey, &'static str)> = Vec::new();
+                    // A local goto is a jump inside this function: its
+                    // targets keep the PHP history of the path that reached it.
+                    let succ_stack = if local_goto {
+                        key.p_stack.clone()
+                    } else {
+                        Vec::new()
+                    };
                     // Ptrcall handlers are separate call demands. Importing
                     // their RTSes contaminates this routine's exit widths.
                     if !auth.ptr_call {
@@ -1466,10 +1533,16 @@ pub fn decode_function(
                             let e16 = e & 0xFFFF;
                             if eb == bank
                                 && ((0x8000..=0xFFFF).contains(&e16)
-                                    || addr_in_reloc_region(eb, e16, reloc).is_some())
+                                    || addr_in_reloc_region(eb, e16, reloc).is_some()
+                                    || (local_goto && is_rom_address(mapping, eb, e16)))
                             {
                                 extra_succs.push((
-                                    DecodeKey::new(addr24(eb, e16), site_m, site_x),
+                                    DecodeKey::with_stack(
+                                        addr24(eb, e16),
+                                        site_m,
+                                        site_x,
+                                        succ_stack.clone(),
+                                    ),
                                     "jump",
                                 ));
                             }
@@ -4811,6 +4884,71 @@ mod tests {
         let (m, x, s3) = post_state(&plp, m, x, &s2);
         assert_eq!((m, x), (0, 1)); // restored
         assert!(s3.is_empty());
+    }
+
+    #[test]
+    fn dispatch_under_php_keeps_targets_local() {
+        // FF6 ValidateSpellList shape, HiROM bank C0 below $8000:
+        // PHX; PHP; REP #$10; LDX #0; LDY #2; JMP ($5700,X); targets
+        // LDA #n; JMP tail; tail DEY; BNE site; PLP; PLX; RTS. Split into
+        // tail calls, each target's PLP kept X=0 and the PLX pulled 16 bits.
+        let mut rom = vec![0u8; 0x10000];
+        let body: &[u8] = &[
+            0xDA, 0x08, 0xC2, 0x10, 0xA2, 0x00, 0x00, 0xA0, 0x02, 0x00, 0x7C, 0x00, 0x57, 0x88,
+            0xD0, 0xFA, 0x28, 0xFA, 0x60,
+        ];
+        rom[0x5680..0x5680 + body.len()].copy_from_slice(body);
+        rom[0x5700..0x5704].copy_from_slice(&[0x10, 0x57, 0x18, 0x57]);
+        rom[0x5710..0x5715].copy_from_slice(&[0xA9, 0x01, 0x4C, 0x8D, 0x56]);
+        rom[0x5718..0x571D].copy_from_slice(&[0xA9, 0x02, 0x4C, 0x8D, 0x56]);
+        let dispatch = HashMap::from([(
+            0xC0568Au32,
+            IndirectDispatchSite {
+                count: 2,
+                idx_reg: 'X',
+                table_bases: vec![],
+                ptr_call: false,
+                return_pc: None,
+                frame_size: None,
+                pointer_match: false,
+                popped_call_frame: false,
+                rts_stack: false,
+                targets: vec![],
+            },
+        )]);
+        let siblings = std::collections::BTreeSet::from([0x5710u32, 0x5718]);
+        let env = DecodeEnv {
+            rom_mapping: RomMapping::HiRom,
+            indirect_dispatch: Some(&dispatch),
+            sibling_entry_pcs: Some(&siblings),
+            ..DecodeEnv::default()
+        };
+        let site_of = |g: &FunctionDecodeGraph| {
+            g.insns()
+                .iter()
+                .find(|d| d.key.pc == 0xC0568A)
+                .map(|d| d.insn.dispatch_local_goto)
+        };
+
+        let g = decode_function(&rom, 0xC0, 0x5680, 1, 1, None, &env);
+        assert_eq!(site_of(&g), Some(true));
+        for t in [0x5710u32, 0x5718] {
+            let key = DecodeKey::with_stack(addr24(0xC0, t), 1, 0, vec![(1, 1)]);
+            assert!(g.get(&key).is_some(), "target {t:04X} not decoded locally");
+        }
+        let plx: Vec<(u8, u8)> = g
+            .insns()
+            .iter()
+            .filter(|d| d.key.pc == 0xC05691)
+            .map(|d| (d.key.m, d.key.x))
+            .collect();
+        assert_eq!(plx, vec![(1, 1)], "PLX must decode at the pushed X=1");
+
+        // Without the PHP/PLP pair the site keeps its tail calls.
+        rom[0x5681] = 0xEA;
+        rom[0x5690] = 0xEA;
+        let g = decode_function(&rom, 0xC0, 0x5680, 1, 1, None, &env);
+        assert_eq!(site_of(&g), Some(false));
     }
 
     /// 32 KiB LoROM bank-0 image; `blobs` maps local PC ($8000+) to bytes.

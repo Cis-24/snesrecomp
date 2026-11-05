@@ -1532,6 +1532,13 @@ def _emit_indirect_dispatch(insn) -> List[str]:
                 f"  uint16 _target = (uint16)(cpu_read16(cpu, 0x00, "
                 f"(uint16)(cpu->D + 0x{ptr:04x})) + 1u);"
                 "  /* PEI(dp); RTS consumes target-1 as an internal goto */")
+        elif getattr(insn, 'mode', None) == INDIR_X:
+            # JMP (abs,X): the pointer lives at PB:(abs + X), the target bank
+            # is PB (a dispatch kept local because its path holds a PHP).
+            lines.append(
+                f"  uint16 _target = cpu_read16(cpu, cpu->PB, "
+                f"(uint16)(0x{ptr:04x} + (cpu->X & 0xFFFF)));"
+                "  /* indexed indirect dispatch: switch on the loaded pointer */")
         else:
             # JMP (abs): the pointer lives in bank 0, the target bank is PB.
             lines.append(

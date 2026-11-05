@@ -286,6 +286,45 @@ def _autorecover_indirect_xtable(rom: bytes, bank: int, insn,
     return entries, index_bias
 
 
+def _is_local_dispatch_target(bank: int, pc16: int) -> bool:
+    """A computed-goto target this function can decode as its own label.
+
+    The plain dispatch successor filter keeps only $8000-$FFFF, which leaves
+    out HiROM code below $8000 (FF6 bank $C2). A local goto needs a label for
+    every case, so it asks the mapping instead."""
+    from snes65816 import is_rom_address
+    return is_rom_address(bank, pc16)
+
+
+def _held_php_dispatch_stays_local(insn, key, bank: int, entries,
+                                   *, is_ptr_call: bool,
+                                   popped_call_frame: bool) -> bool:
+    """True when a short JMP (abs) / JMP (abs,X) tail dispatch must keep its
+    targets inside the current function because its path holds a PHP.
+
+    Only plain tail transfers qualify: a pointer call (PEA + JMP) enters its
+    handlers as calls, a popped-call-frame dispatch hands over a caller frame,
+    and a long JML may leave the bank. Every target has to be a ROM label in
+    this bank; otherwise the site keeps its tail calls."""
+    if not key.p_stack or is_ptr_call or popped_call_frame:
+        return False
+    if getattr(insn, 'mnem', None) != 'JMP':
+        return False
+    if getattr(insn, 'mode', None) not in (INDIR, INDIR_X):
+        return False
+    if getattr(insn, 'dispatch_kind', 'short') != 'short':
+        return False
+    targets = [e for e in entries if e]
+    if not targets:
+        return False
+    for e in targets:
+        if ((e >> 16) & 0xFF) != (bank & 0xFF):
+            return False
+        if not _is_local_dispatch_target(bank, e & 0xFFFF):
+            return False
+    return True
+
+
 def _autorecover_local_stride_runway(rom: bytes, bank: int, func_start: int,
                                      site_pc: int, insn,
                                      *,
@@ -2506,6 +2545,23 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                     insn.dispatch_entries = entries
                     insn.dispatch_kind = _dispatch_kind(
                         insn, auth.get('table_bases', ()))
+                    # A tail dispatch made while this path holds a PHP stays
+                    # inside this function, like a plain jump onto a sibling
+                    # entry (see the sibling gate in the worklist). Split into
+                    # separate functions, each target would pop a P it never
+                    # pushed and decode the rest at the dispatch-site width:
+                    # FF6's ValidateSpellList does `PHP; LONGI; ...;
+                    # JMP (tbl,X)`, and every target ends in the shared
+                    # `PLP; PLX; RTS`, whose PLX then pulled 16 bits after a
+                    # PLP that had restored X=1. Kept local, the targets carry
+                    # the PHP history and the PLP restores the pushed width.
+                    if (not is_local_goto
+                            and _held_php_dispatch_stays_local(
+                                insn, key, bank, entries,
+                                is_ptr_call=is_ptr_call,
+                                popped_call_frame=bool(
+                                    auth.get('popped_call_frame')))):
+                        is_local_goto = True
                     insn.dispatch_idx_reg = auth['idx_reg']
                     # Byte distance from the operand to entry 0 (see
                     # `_autorecover_indirect_xtable`). codegen subtracts it
@@ -2558,14 +2614,21 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                     extra_succs = []
                     site_m = insn.m_flag & 1
                     site_x = insn.x_flag & 1
+                    # A local goto is a jump inside this function: its targets
+                    # keep the PHP history of the path that reached it.
+                    succ_p_stack = key.p_stack if is_local_goto else ()
                     for e in entries:
                         if e is None or e == 0:
                             continue
                         eb = (e >> 16) & 0xFF
                         e16 = e & 0xFFFF
-                        if eb == bank and 0x8000 <= e16 <= 0xFFFF:
+                        if eb == bank and (
+                                0x8000 <= e16 <= 0xFFFF
+                                or (is_local_goto
+                                    and _is_local_dispatch_target(bank, e16))):
                             extra_succs.append(
-                                (DecodeKey(addr24(eb, e16), site_m, site_x, ()),
+                                (DecodeKey(addr24(eb, e16), site_m, site_x,
+                                           succ_p_stack),
                                  'jump'))
                     # JMP/JML indirect is normally a TERMINATOR (no
                     # fall-through). The pointer-sourced CALL form (PEA <ret>;
