@@ -1477,9 +1477,17 @@ static void PpuCaptureBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer) {
 
 /* Modes 2/4/6 use BG3's tilemap as per-column scroll overrides for the
  * displayed layers.  Mode 2 (the Star Fox attract/game perspective screens)
- * has separate horizontal and vertical rows: BG3VOFS-1 selects the horizontal
- * row and BG3VOFS+7 the vertical row.  Bit 13 enables BG1, bit 14 enables BG2.
- * The first visible tile column cannot be offset on hardware. */
+ * has separate horizontal and vertical rows: BG3VOFS selects the horizontal
+ * row and BG3VOFS+8 the vertical row.  Bit 13 enables BG1, bit 14 enables BG2.
+ * The first visible tile column cannot be offset on hardware.
+ *
+ * vScroll[] holds the raw BGnVOFS value and `y` counts visible lines from 1,
+ * so a plain layer samples row vScroll + y.  snes9x keeps BGnVOFS + 1 per line
+ * and a 0-based line instead; its OPT code subtracts that 1 again to pick the
+ * rows and adds it back to a V-offset entry.  Taken over one to one on raw
+ * values, the rows sat one line too high (BG3VOFS = 0 read the V offsets from
+ * the H row) and an offset column one line too low.  Regression:
+ * tests/ppu/ppu_mode2_opt_test.c. */
 static void PpuDrawBackground_4bpp_opt(Ppu *ppu, uint y, bool sub, uint layer,
                                       PpuZbufType zhi, PpuZbufType zlo) {
   uint8_t *capture = NULL;
@@ -1513,7 +1521,7 @@ static void PpuDrawBackground_4bpp_opt(Ppu *ppu, uint y, bool sub, uint layer,
   const unsigned hscroll = ppu->hScroll[layer];
   const unsigned vscroll = ppu->vScroll[layer];
   const unsigned opt_hscroll = ppu->hScroll[2];
-  const unsigned opt_vscroll = ppu->vScroll[2] - 1u;
+  const unsigned opt_vscroll = ppu->vScroll[2];
   const int opt_hrow = (opt_vscroll & opt_coord_mask) >> opt_shift;
   const int opt_vrow = ((opt_vscroll + 8) & opt_coord_mask) >> opt_shift;
   const uint16 enable = (uint16)(0x2000u << layer);
@@ -1545,7 +1553,7 @@ static void PpuDrawBackground_4bpp_opt(Ppu *ppu, uint y, bool sub, uint layer,
         if (hcell & enable)
           hoffset = (hcell & ~7) | (hscroll & 7);
         if (vcell & enable)
-          voffset = (uint16)(vcell + 1);
+          voffset = vcell;
       }
 
       const unsigned sx =

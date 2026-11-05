@@ -112,6 +112,16 @@ echo "=== PPU mosaic table without a line 0 ==="
     -lm -o "$OUT/ppu_mosaic_table_test"
 "$OUT/ppu_mosaic_table_test"
 
+echo "=== PPU Mode 2 offset-per-tile rows ==="
+"$CC" -std=c11 -Wall -Wextra -O1 \
+    -DSNESRECOMP_REVERSE_DEBUG=0 \
+    -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes" \
+    "$ROOT/tests/ppu/ppu_mode2_opt_test.c" \
+    "$ROOT/runner/src/snes/ppu.c" \
+    "$ROOT/runner/src/snes/ppu_legacy.c" \
+    -lm -o "$OUT/ppu_mode2_opt_test"
+"$OUT/ppu_mode2_opt_test"
+
 echo "=== DMA / HDMA ==="
 # sdd1.c is upstream's vendored S-DD1 decoder and is not -Werror clean here:
 # sdd1.c:773 reads `(a16 >= 0x00 && 0)`, an always-true comparison on a
