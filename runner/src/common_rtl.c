@@ -284,6 +284,26 @@ static uint64_t rtl_apu_guest_cycle(void) {
          within * RTL_APU_CYCLES_PER_FRAME /
              RTL_MASTER_CYCLES_PER_FRAME;
 }
+
+/* The SPC runs from reset. Without a mapping from guest time to the SPC
+ * clock, apu_runToGuestCycle does nothing, and the mapping used to come only
+ * with the CPU's first write to $2140-$2143: until then neither port reads
+ * nor the frame-boundary sync ran the SPC (FF6 writes first about 5888 SPC
+ * cycles into its first frame). Map the start of the frame instead whenever
+ * nothing is mapped: the first frame after reset, or the frame after an HLE
+ * upload cleared the port schedule. */
+static void rtl_apu_anchor_frame_start(void) {
+  if (!g_snes || !g_snes->apu)
+    return;
+#ifdef SNES_COSIM
+  /* The shared-clock co-sim paces the SPC by port touches alone. */
+  if (cosim_apu_shared_clock())
+    return;
+#endif
+  RtlApuLock();
+  apu_anchorGuestTime(g_snes->apu, rtl_apu_guest_cycle());
+  RtlApuUnlock();
+}
 // $420D bit 0 (FastROM / MEMSEL): 1 => $80-$FF:$8000-$FFFF code runs fast (6
 // master clocks/access) instead of slow (8). Tracked here so emitted blocks in
 // the WS2 mirror banks weight their master-cycle charge correctly at runtime.
@@ -811,6 +831,7 @@ bool RtlRunFrame(uint32 inputs) {
   g_apu_frame_start_master = g_cpu.master_cycles;
   g_apu_frame_time_valid = true;
   rtl_apu_clock_begin(&g_apu_frame_clock, g_cpu.master_cycles);
+  rtl_apu_anchor_frame_start();
   WatchdogFrameStart();
   // Watchdog guard: WatchdogCheck() (called per-block in v2 gen) longjmps
   // here when a frame exceeds 5s, so an infinite loop in recompiled code

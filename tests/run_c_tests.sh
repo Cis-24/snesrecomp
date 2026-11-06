@@ -344,6 +344,21 @@ echo "=== APU guest-time pacing ==="
     $GC_SECTIONS_LINKER -o "$OUT/apu_port_guest_time_test"
 "$OUT/apu_port_guest_time_test"
 
+echo "=== APU frame timeline from reset ==="
+# Includes common_rtl.c whole and drives RtlRunFrame; see the note on
+# RTL_UNIT_FLAGS below.
+"$CC" $(pkg-config --cflags sdl2) -std=c11 -Wall -Wextra -O2 -flto -fwhole-program \
+    -ffunction-sections -fdata-sections -DSNESRECOMP_TRACE=0 -D_POSIX_C_SOURCE=200809L \
+    -I "$ROOT/runner/src/desktop" -I "$ROOT/runner/src" \
+    "$ROOT/tests/audio/apu_frame_timeline_test.c" \
+    "$ROOT/runner/src/snes/apu.c" \
+    "$ROOT/runner/src/snes/spc.c" \
+    "$ROOT/runner/src/snes/dsp.c" \
+    "$ROOT/runner/src/snes/joypad.c" \
+    "$ROOT/runner/src/audio_trace.c" \
+    $GC_SECTIONS_LINKER -lm -o "$OUT/apu_frame_timeline_test"
+"$OUT/apu_frame_timeline_test"
+
 echo "=== benchmark helper ==="
 "$CC" -std=c11 -Wall -Wextra -Werror -O1 \
     -I "$ROOT/runner/src" \

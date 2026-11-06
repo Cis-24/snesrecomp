@@ -127,6 +127,19 @@ bool apu_schedulePortWrite(Apu* apu, uint8_t port, uint8_t val,
   return true;
 }
 
+bool apu_anchorGuestTime(Apu* apu, uint64_t guest_cycle) {
+  /* An existing mapping stays: queued writes keep their guest deltas, and a
+   * callback that ran ahead is rebased by apu_schedulePortWrite as before. */
+  if (apu->portTimeValid)
+    return false;
+  apu->portGuestAnchor = guest_cycle;
+  apu->portTargetAnchor = apu->portClock;
+  apu->portLastGuest = guest_cycle;
+  apu->portLastTarget = apu->portClock;
+  apu->portTimeValid = true;
+  return true;
+}
+
 /* Apply all CPU bus events due before this SPC cycle executes. */
 static void apu_drainPortQueue(Apu* apu) {
   while (apu->portQHead != apu->portQTail) {

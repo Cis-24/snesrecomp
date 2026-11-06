@@ -108,6 +108,11 @@ void apu_writePortNow(Apu* apu, uint8_t port, uint8_t val);
  * enqueue the write. False means the caller must advance the APU and retry. */
 bool apu_schedulePortWrite(Apu* apu, uint8_t port, uint8_t val,
                            uint64_t guest_cycle);
+/* Map a guest timestamp onto the SPC's current cycle without a bus event,
+ * unless a mapping exists already. A runtime with a frame timeline calls this
+ * where the timeline starts, so the SPC runs from reset as on hardware rather
+ * than from the CPU's first port write. True if it set the mapping. */
+bool apu_anchorGuestTime(Apu* apu, uint64_t guest_cycle);
 uint32_t apu_portQueueDepth(const Apu* apu);
 /* Advance real SPC execution until every queued bus event has landed. */
 bool apu_runUntilPortQueueEmpty(Apu* apu, uint32_t max_cycles);

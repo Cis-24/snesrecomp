@@ -236,6 +236,57 @@ int main(void) {
   failures += check(rtl_apu_clock_now(&clock, 0) == clock.start_guest,
                     "CPU reset cannot underflow the within-frame timestamp");
 
+  /* The SPC runs from reset: a runtime maps the start of its frame timeline
+   * without a port write, and guest-clock syncs run the SPC from there. */
+  apu_reset(apu);
+  failures += check(apu_runToGuestCycle(apu, 3000, 1u << 20) &&
+                    apu->portClock == 0,
+                    "an unmapped timeline does not run the SPC");
+  failures += check(apu_anchorGuestTime(apu, 0) && apu->portTimeValid,
+                    "frame start maps guest time at reset");
+  failures += check(apu_runToGuestCycle(apu, 3000, 1u << 20) &&
+                    apu->portClock == 3000,
+                    "the SPC runs from reset without a port write");
+  failures += check(apu_schedulePortWrite(apu, 0, 0xcc, 5888) &&
+                    apu->portLastTarget == 5888,
+                    "a first port write keeps its guest time since reset");
+  failures += check(!apu_anchorGuestTime(apu, 9000) &&
+                    apu->portGuestAnchor == 0 && apu->portTargetAnchor == 0,
+                    "a frame start keeps an existing mapping");
+  failures += check(apu_runToGuestCycle(apu, 6000, 1u << 20) &&
+                    apu->portClock == 6000 && apu->inPorts[0] == 0xcc,
+                    "the write lands at its guest time");
+  /* A callback that ran ahead of the mapping is still rebased by the next
+   * write, not pulled back. */
+  apu_runCycles(apu, 1000);
+  failures += check(apu_schedulePortWrite(apu, 1, 0x11, 6100) &&
+                    apu->portLastTarget == 7000 &&
+                    apu->portGuestAnchor == 6100,
+                    "callback-ahead rebase survives the reset mapping");
+
+  /* The first frame after reset ends at the first vblank (V=225). A beam
+   * runner measures exactly that span; crediting a whole field put the SPC
+   * 2413 cycles ahead for the rest of the run. WAI keeps its hardware frame
+   * from the second frame on. */
+  const uint64_t to_first_vblank =
+      225ull * 1364ull * RTL_APU_CYCLES_PER_FRAME / RTL_MASTER_CYCLES_PER_FRAME;
+  clock = (RtlApuFrameClock){0};
+  rtl_apu_clock_begin(&clock, 1000);
+  end = rtl_apu_clock_finish(&clock, 1000 + 306902);
+  failures += check(end == 306902 * RTL_APU_CYCLES_PER_FRAME /
+                               RTL_MASTER_CYCLES_PER_FRAME &&
+                        end == to_first_vblank && clock.last_duration == end,
+                    "first frame counts reset to V=225, not a whole field");
+  rtl_apu_clock_begin(&clock, 1000 + 306902);
+  end = rtl_apu_clock_finish(&clock, 1000 + 306902 + 100);
+  failures += check(end == to_first_vblank + RTL_APU_CYCLES_PER_FRAME,
+                    "WAI still advances a hardware frame after the first");
+  clock = (RtlApuFrameClock){0};
+  rtl_apu_clock_begin(&clock, 0);
+  end = rtl_apu_clock_finish(&clock, 100);
+  failures += check(end == to_first_vblank,
+                    "a WAI-short first frame still reaches the first vblank");
+
 #if !SNESRECOMP_SPC_DIAGNOSTICS
   failures += check(g_spc_pc_histogram[0] == 0 &&
                     g_spc_pc_max_seen == 0,
