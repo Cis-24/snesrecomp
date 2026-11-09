@@ -194,3 +194,18 @@ def read_fn(width: int) -> str:
 def write_fn(width: int) -> str:
     """C function name for a width-bound memory write."""
     return "cpu_write8" if width == 1 else "cpu_write16"
+
+
+# The paced forms (cpu_state.h) add the bus time of the transfer to
+# cpu->master_cycles. Generated code uses them for every data transfer the
+# instruction performs on hardware; the block constant covers only the
+# fetch and internal cycles (snes_cycles.py, "Bus split").
+
+def paced_read_fn(width: int) -> str:
+    """C function name for a width-bound, bus-priced memory read."""
+    return "cpu_read8_paced" if width == 1 else "cpu_read16_paced"
+
+
+def paced_write_fn(width: int) -> str:
+    """C function name for a width-bound, bus-priced memory write."""
+    return "cpu_write8_paced" if width == 1 else "cpu_write16_paced"

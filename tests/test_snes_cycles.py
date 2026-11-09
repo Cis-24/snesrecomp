@@ -252,6 +252,77 @@ def test_block_static_cycles():
     assert const + 1 == 17
 
 
+def _split(op, m=1, x=1):
+    return (sc.fetch_cycles(op, m, x), sc.data_cycles(op, m, x),
+            sc.internal_cycles(op, m, x))
+
+
+def test_bus_split_follows_the_datasheet_bus_sequence():
+    # (fetch, data, internal) per the W65C816S cycle-by-cycle tables.
+    assert _split(0xA5) == (2, 1, 0)            # LDA dp
+    assert _split(0xA5, m=0) == (2, 2, 0)       # LDA dp, 16-bit
+    assert _split(0xB5) == (2, 1, 1)            # LDA dp,X: indexing IO
+    assert _split(0xAD) == (3, 1, 0)            # LDA abs
+    assert _split(0xBD, x=0) == (3, 1, 1)       # LDA abs,X, X=0: indexing IO
+    assert _split(0x9D) == (3, 1, 1)            # STA abs,X: always the IO
+    assert _split(0xAF) == (4, 1, 0)            # LDA long
+    assert _split(0xB2) == (2, 3, 0)            # LDA (dp): pointer + operand
+    assert _split(0xA1) == (2, 3, 1)            # LDA (dp,X)
+    assert _split(0xB1) == (2, 3, 0)            # LDA (dp),Y read
+    assert _split(0x91) == (2, 3, 1)            # STA (dp),Y
+    assert _split(0xB7) == (2, 4, 0)            # LDA [dp],Y: 24-bit pointer
+    assert _split(0xA3) == (2, 1, 1)            # LDA sr,S
+    assert _split(0xB3) == (2, 3, 2)            # LDA (sr,S),Y
+    assert _split(0x06) == (2, 2, 1)            # ASL dp: read, IO, write
+    assert _split(0x0E, m=0) == (3, 4, 1)       # ASL abs, 16-bit
+    assert _split(0x1E) == (3, 2, 2)            # ASL abs,X
+    assert _split(0xA9) == (2, 0, 0)            # LDA #imm: operand is fetched
+    assert _split(0xA9, m=0) == (3, 0, 0)
+    assert _split(0x20) == (3, 2, 1)            # JSR abs: push PCH, PCL
+    assert _split(0xFC) == (3, 4, 1)            # JSR (abs,X): push + pointer
+    assert _split(0x22) == (4, 3, 1)            # JSL: push PB, PCH, PCL
+    assert _split(0x60) == (1, 2, 3)            # RTS
+    assert _split(0x6B) == (1, 3, 2)            # RTL
+    assert _split(0x40) == (1, 4, 2)            # RTI native
+    assert _split(0x00) == (2, 6, 0)            # BRK native: 4 pushes, vector
+    assert _split(0x6C) == (3, 2, 0)            # JMP (abs)
+    assert _split(0x7C) == (3, 2, 1)            # JMP (abs,X)
+    assert _split(0xDC) == (3, 3, 0)            # JML [abs]
+    assert _split(0x48) == (1, 1, 1)            # PHA
+    assert _split(0x48, m=0) == (1, 2, 1)
+    assert _split(0x68) == (1, 1, 2)            # PLA
+    assert _split(0xFA, x=0) == (1, 2, 2)       # PLX, 16-bit
+    assert _split(0x0B) == (1, 2, 1)            # PHD
+    assert _split(0x2B) == (1, 2, 2)            # PLD
+    assert _split(0xF4) == (3, 2, 0)            # PEA
+    assert _split(0xD4) == (2, 4, 0)            # PEI
+    assert _split(0x62) == (3, 2, 1)            # PER
+    assert _split(0x54) == (3, 2, 2)            # MVN, per byte
+    assert _split(0xD0) == (2, 0, 0)            # BNE not taken
+    assert _split(0x80) == (2, 0, 1)            # BRA
+    assert _split(0x82) == (3, 0, 1)            # BRL
+    assert _split(0xEA) == (1, 0, 1)            # NOP
+    assert _split(0xEB) == (1, 0, 2)            # XBA
+    assert _split(0xC2) == (2, 0, 1)            # REP
+    assert _split(0xCB) == (1, 0, 2)            # WAI
+
+
+def test_bus_split_adds_up_for_every_opcode_and_width():
+    from snes65816 import opcode_table
+    for op in opcode_table():
+        for m in (0, 1):
+            for x in (0, 1):
+                f, d, i = _split(op, m, x)
+                assert f >= 1 and d >= 0 and i >= 0, (hex(op), m, x, f, d, i)
+                assert f + d + i == sc.instr_static_cycles(op, m, x), hex(op)
+
+
+def test_block_bus_split():
+    block = [(0x9E, 1, 0), (0xE8, 1, 0), (0xE0, 1, 0), (0xD0, 1, 0)]
+    assert sc.block_bus_split(block) == (9, 1, 2)   # STZ abs,X;INX;CPX#;BNE
+    assert sum(sc.block_bus_split(block)) == sc.block_static_cycles(block)[0]
+
+
 def test_generated_header_matches_authority():
     """The checked-in snes_cycles.h must be regenerated from the authority;
     if this fails, run: python recompiler/snes_cycles.py --emit-c

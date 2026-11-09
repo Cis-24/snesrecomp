@@ -415,12 +415,9 @@ uint16 cpu_read16(CpuState *cpu, uint8 bank, uint16 addr);
 void   cpu_write8 (CpuState *cpu, uint8 bank, uint16 addr, uint8  v);
 void   cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v);
 
-/* Region-paced AOT bus (2026-08-31): the AOT emitter charges block const
- * cycles minus data transfers, and paces each data/stack/pointer access
- * here at its region speed so master_cycles matches the LLE per-transfer
- * model exactly. Only generated (AOT) code calls the _paced forms; the
- * interpreter's bridge shims use the plain accessors (they account
- * transfers themselves). */
+/* Master clocks of one bus transfer at a 24-bit address (region speed). The
+ * interpreter's bridge prices its transfers with it; generated code uses the
+ * inline cpu_bus_speed and the paced accessors declared after g_memsel. */
 uint32_t  cpu_region_speed(uint32_t adr);
 /* SNESRECOMP_WLOG_ADDR hook for direct-WRAM stores that bypass cpu_write8/16
  * (DMA A-bus writes in snes_write, WMDATA $2180). wa = g_ram offset. */
@@ -429,10 +426,6 @@ void wlog_addr_note_direct(uint32_t wa, uint8_t v, const char *via);
  * by interp_bridge.c at load when that TU is linked, NULL otherwise. */
 #include <stdio.h>
 extern void (*g_interp_recent_dump_hook)(int n, FILE *out);
-uint8  cpu_read8_paced (CpuState *cpu, uint8 bank, uint16 addr);
-uint16 cpu_read16_paced(CpuState *cpu, uint8 bank, uint16 addr);
-void   cpu_write8_paced (CpuState *cpu, uint8 bank, uint16 addr, uint8  v);
-void   cpu_write16_paced(CpuState *cpu, uint8 bank, uint16 addr, uint16 v);
 
 /* ── Interrupt-frame ABI (Option-1 cpu->S model) ────────────────────────── */
 
@@ -515,6 +508,67 @@ void wlog_scope_exit(void);
  * declared here so every generated translation unit (which always includes
  * cpu_state.h) can see it. SlowROM games never set it and emit no reference. */
 extern uint8_t g_memsel;
+
+/* ── Region-paced bus for generated code ─────────────────────────────────
+ * Generated (AOT) code prices time the way the interpreter does: every bus
+ * transfer at the speed of its address, every internal cycle at 6 master
+ * clocks (recompiler/snes_cycles.py, "Bus split"). A block's constant
+ * charges its opcode and operand fetches at the code speed and its internal
+ * cycles at 6; each data transfer (operand, indirect pointer, stack, vector)
+ * goes through the paced accessors below, which add the speed of the address
+ * they touch. The plain cpu_read8/16 and cpu_write8/16 stay unpaced: the
+ * interpreter's bridge shims call them inside their own per-transfer
+ * accounting, and generated bookkeeping (return-frame peeks, dispatch
+ * pointers already charged by cpu_bus_charge) must not be priced twice.
+ * Word forms price both bytes at their own address (a word can straddle a
+ * region boundary). Mirrors snes_cycles.py::region_speed and
+ * cpu_region_speed exactly. */
+static inline uint32_t cpu_bus_speed(uint8 bank, uint16 addr) {
+    if (bank >= 0x40 && bank <= 0x7f) return 8;
+    if (bank >= 0xc0) return g_memsel ? 6 : 8;
+    if (addr >= 0x8000) {
+        if (bank <= 0x3f) return 8;
+        return g_memsel ? 6 : 8;
+    }
+    if (addr < 0x2000) return 8;
+    if (addr < 0x4000) return 6;
+    if (addr < 0x4200) return 12;
+    if (addr < 0x6000) return 6;
+    return 8;
+}
+
+/* A word transfer is two bus cycles; the high byte is at addr + 1 within the
+ * bank (the same carry rule as cpu_read16/cpu_write16 for bank-local data). */
+static inline uint32_t cpu_bus_speed16(uint8 bank, uint16 addr) {
+    return cpu_bus_speed(bank, addr) + cpu_bus_speed(bank, (uint16)(addr + 1u));
+}
+
+/* Charge the bus time of a transfer the generated code models without
+ * performing it through a paced accessor (dispatch pointers, inlined call
+ * frames). */
+static inline void cpu_bus_charge(CpuState *cpu, uint8 bank, uint16 addr) {
+    cpu->master_cycles += cpu_bus_speed(bank, addr);
+}
+
+static inline uint8 cpu_read8_paced(CpuState *cpu, uint8 bank, uint16 addr) {
+    cpu->master_cycles += cpu_bus_speed(bank, addr);
+    return cpu_read8(cpu, bank, addr);
+}
+
+static inline uint16 cpu_read16_paced(CpuState *cpu, uint8 bank, uint16 addr) {
+    cpu->master_cycles += cpu_bus_speed16(bank, addr);
+    return cpu_read16(cpu, bank, addr);
+}
+
+static inline void cpu_write8_paced(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
+    cpu->master_cycles += cpu_bus_speed(bank, addr);
+    cpu_write8(cpu, bank, addr, v);
+}
+
+static inline void cpu_write16_paced(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
+    cpu->master_cycles += cpu_bus_speed16(bank, addr);
+    cpu_write16(cpu, bank, addr, v);
+}
 
 /* Diagnostic — generated functions can call this to log entry. */
 void cpu_dbg_funcname(const char *name);

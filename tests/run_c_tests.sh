@@ -165,6 +165,16 @@ echo "=== beam frame driver ==="
     -lm -o "$OUT/beam_frame_driver_test"
 "$OUT/beam_frame_driver_test"
 
+echo "=== codegen vs interp816 (semantics, cycles, bus-priced master clocks) ==="
+"${PYTHON:-python3}" "$ROOT/tests/cpu_diff/gen_ops.py" "$OUT/cpu_diff_gen_ops.c"
+"$CC" -std=c11 -O1 -w \
+    -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes" -I "$ROOT/tests/cpu_diff" \
+    "$ROOT/tests/cpu_diff/cpu_diff.c" \
+    "$OUT/cpu_diff_gen_ops.c" \
+    "$ROOT/runner/src/snes/interp816.c" \
+    -o "$OUT/cpu_diff"
+"$OUT/cpu_diff"
+
 echo "=== fiber snapshot (rewindable execution position) ==="
 # Darwin exposes the POSIX context API but marks it deprecated.
 "$CC" $FIBER_PLATFORM_FLAGS -std=c11 -Wall -Wextra -Werror -O1 \

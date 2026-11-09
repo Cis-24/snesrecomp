@@ -40,10 +40,12 @@ from v2.naming import (  # noqa: E402
     variant_suffix as _variant_suffix,
 )
 from snes_cycles import (  # noqa: E402
-    block_static_cycles, instr_runtime_charges,
+    block_static_cycles, instr_runtime_charges, data_cycles, fetch_cycles,
+    internal_cycles,
 )
 from snes65816 import (  # noqa: E402
     ABS_X as _MODE_ABS_X, ABS_Y as _MODE_ABS_Y, IMM as _MODE_IMM,
+    ABS as _MODE_ABS, LONG as _MODE_LONG,
     get_rom_mapping, ROM_MAP_SA1, rom_offset,
 )
 from v2.ir import (  # noqa: E402
@@ -117,7 +119,7 @@ def _live_operand(insn, ops: List[IROp]) -> List[IROp]:
         raise ValueError(
             f"live_operand at ${pc:06X}: {insn.mnem} lowers without a leading "
             f"constant operand to replace")
-    return [Read(seg=seg, width=first.width, out=first.out)] + list(ops[1:])
+    return [Read(seg=seg, width=first.width, out=first.out, fetch=True)] + list(ops[1:])
 
 
 def _block_cycle_const(pairs) -> int:
@@ -143,24 +145,103 @@ def _block_cycle_const(pairs) -> int:
     return const
 
 
+def _insn_bus_split(insn, elided_data: bool = False):
+    """(fetch, internal) cycles of one instruction for the master charge.
+
+    The block constant prices the opcode and operand fetches at the code
+    speed and the internal cycles at 6; the instruction's data transfers are
+    priced by the paced accessors as they happen (snes_cycles.py, "Bus
+    split"). An instruction whose emission is elided (trampoline setup, NLR
+    pulls) performs no data transfer, so its data cycles stay in the
+    constant at the internal price instead of being dropped.
+    """
+    op = getattr(insn, 'opcode', None)
+    if op is None:
+        return 0, 0
+    m = getattr(insn, 'm_flag', 1)
+    x = getattr(insn, 'x_flag', 1)
+    fetch = fetch_cycles(op, m, x)
+    internal = internal_cycles(op, m, x)
+    if elided_data:
+        internal += data_cycles(op, m, x)
+    return fetch, internal
+
+
+# Store forms whose static address can be the general-purpose DMA enable.
+_STORE_MNEMS = frozenset({'STA', 'STX', 'STY', 'STZ'})
+_MDMAEN = 0x420B
+
+
+def _writes_mdmaen(insn) -> bool:
+    """True when `insn` stores to $420B (MDMAEN) through a static address.
+
+    Writing MDMAEN runs the general-purpose DMA at once; its time can carry
+    the master clock past the frame deadline in the middle of a block. FF6
+    stores it as `sta/stz/stx/sty hMDMAEN` (abs), `sta f:hMDMAEN` (long) and
+    16-bit `sta hMDMAEN - 1`. An abs store reaches the register only with DB
+    in a system bank; the extra deadline check after it is harmless when DB
+    is elsewhere.
+    """
+    mn = getattr(insn, 'mnem', None)
+    if mn not in _STORE_MNEMS:
+        return False
+    mode = getattr(insn, 'mode', None)
+    operand = getattr(insn, 'operand', 0) or 0
+    if mode == _MODE_ABS:
+        base = operand & 0xFFFF
+    elif mode == _MODE_LONG:
+        b = (operand >> 16) & 0xFF
+        if not (b <= 0x3F or 0x80 <= b <= 0xBF):
+            return False
+        base = operand & 0xFFFF
+    else:
+        return False
+    if mn in ('STX', 'STY'):
+        width = 1 if (getattr(insn, 'x_flag', 1) & 1) else 2
+    else:
+        width = 1 if (getattr(insn, 'm_flag', 1) & 1) else 2
+    return base <= _MDMAEN <= base + width - 1
+
+
+def _master_charge_expr(fetch: int, internal: int, spd_expr: str, spd_const):
+    """C expression for a block segment's master clocks (fetch at the code
+    speed, internal at 6), or None when there is nothing to charge."""
+    if spd_const is not None:
+        total = fetch * spd_const + internal * 6
+        return str(total) if total else None
+    if fetch and internal:
+        return f"{fetch} * {spd_expr} + {internal * 6}"
+    if fetch:
+        return f"{fetch} * {spd_expr}"
+    if internal:
+        return f"{internal * 6}"
+    return None
+
+
+# Marker line a block's emit leaves after an MDMAEN store; composition turns
+# it into the deadline check and the charge of the rest of the block.
+_BUS_SPLIT_MARK = "/*@bus_split@*/"
+
+
 def _block_speed(bank: int, pc: int):
     """Code-region cycle weighting, using live PBR for mirrored bodies."""
     from v2.emitter_helpers import runtime_code_speed
     return runtime_code_speed(((bank & 0xFF) << 16) | (pc & 0xFFFF))
 
 
-def _dynamic_charge_lines(insn, speed_expr: str = "8") -> List[str]:
+def _dynamic_charge_lines(insn) -> List[str]:
     """Runtime-only per-instruction cycle charges (Axis-2 step C dynamics),
     emitted as conditional `cpu->cycles += 1;` statements just before the
     instruction's effect. Branch-taken is charged at the terminator instead.
 
-    Each +1 CPU-cycle charge also adds `speed_expr` master clocks (Axis-5), so
-    the master-clock accumulator stays region-weighted-consistent with `cycles`.
+    Every one of these extra cycles is an internal (bus-idle) cycle, so each
+    adds 6 master clocks, whatever the code region.
 
-    Covered: D.l != 0 (any DP mode); index page-cross for abs,X / abs,Y READS
-    (the base is the static operand; the index is the live register). NOT yet
-    covered (documented residual, measured against bsnes): (dp),Y page-cross
-    (runtime pointer) and MVN/MVP per-byte (the static charge counts one byte).
+    Covered here: D.l != 0 (any DP mode); index page-cross for abs,X / abs,Y
+    READS (the base is the static operand; the index is the live register).
+    The (dp),Y page cross needs the loaded pointer and is charged where the
+    pointer is read (codegen._indirect_y_cross_lines); MVN/MVP charge each
+    repeated byte in their loop (codegen._emit_blockmove).
     """
     op = getattr(insn, 'opcode', None)
     if op is None:
@@ -169,23 +250,21 @@ def _dynamic_charge_lines(insn, speed_expr: str = "8") -> List[str]:
     out: List[str] = []
     if 'dp' in charges:
         out.append(
-            f"if (cpu->D & 0xFF) {{ cpu->cycles += 1; "
-            f"cpu->master_cycles += {speed_expr}; }}  /* D.l != 0 */")
+            "if (cpu->D & 0xFF) { cpu->cycles += 1; "
+            "cpu->master_cycles += 6; }  /* D.l != 0 */")
     if 'xcross' in charges:
         mode = getattr(insn, 'mode', None)
         base = getattr(insn, 'operand', 0) & 0xFFFF
         if mode == _MODE_ABS_X:
             out.append(
                 f"if ((0x{base:04X} & 0xFF00) != ((0x{base:04X} + cpu->X) & 0xFF00))"
-                f" {{ cpu->cycles += 1; cpu->master_cycles += {speed_expr}; }}"
+                f" {{ cpu->cycles += 1; cpu->master_cycles += 6; }}"
                 f"  /* abs,X read page-cross */")
         elif mode == _MODE_ABS_Y:
             out.append(
                 f"if ((0x{base:04X} & 0xFF00) != ((0x{base:04X} + cpu->Y) & 0xFF00))"
-                f" {{ cpu->cycles += 1; cpu->master_cycles += {speed_expr}; }}"
+                f" {{ cpu->cycles += 1; cpu->master_cycles += 6; }}"
                 f"  /* abs,Y read page-cross */")
-        # INDIR_Y (dp),Y: effective pointer is loaded at runtime from DP — not
-        # reconstructable from the static operand; left as a measured residual.
     return out
 
 
@@ -1414,13 +1493,15 @@ def emit_function(rom: bytes, bank: int, start: int,
             f"target outside this bank's import range */"
         )
 
+    block_skip_idx: Dict[DecodeKey, set] = {}
+    block_splits: Dict[DecodeKey, List[int]] = {}
     for key in block_order:
         block = cfg.blocks[key]
         lines: List[str] = []
         block_terminated = False  # True if last op was branch/goto/return/call
-        # Axis-5: master-clocks-per-CPU-cycle for this block's code region, used
-        # to weight the dynamic (D.l/page-cross/branch-taken) master charges.
-        _blk_spd_expr, _blk_spd_const = _block_speed(bank, key.pc)
+        # Instructions after an MDMAEN store end a charge segment (see
+        # _writes_mdmaen); the composition below splits the block constant.
+        block_split_after: List[int] = []
 
         # Iterate the pre-lowered (Insn, [IROp]) pairs. Calling lower()
         # again here would mint fresh Value-ids and break codegen's
@@ -1445,6 +1526,7 @@ def emit_function(rom: bytes, bank: int, start: int,
         # insn so the eventual RTS picks it up.
         pairs = block_per_insn_ir.get(key, [])
         skip_emit_idx = set()
+        block_skip_idx[key] = skip_emit_idx
         for ji, (jdi, _jops) in enumerate(pairs):
             if (jdi.mnem == 'JMP' and jdi.length == 4
                     and getattr(jdi, 'dispatch_entries', None)):
@@ -1572,7 +1654,9 @@ def emit_function(rom: bytes, bank: int, start: int,
                 continue
             # Axis-2 step C dynamics: charge runtime-only modifiers (D.l != 0,
             # abs,X/Y read page-cross) for this instruction before its effect.
-            for _ln in _dynamic_charge_lines(di_insn, _blk_spd_expr):
+            from v2.codegen import set_current_insn as _set_current_insn
+            _set_current_insn(di_insn)
+            for _ln in _dynamic_charge_lines(di_insn):
                 lines.append(_ln)
             for op in ir_ops:
                 if isinstance(op, CondBranch):
@@ -1586,12 +1670,13 @@ def emit_function(rom: bytes, bank: int, start: int,
                     if taken is not None:
                         target_stmt = _goto_or_return(taken, source_pc24=blk_pc24)
                         # Axis-2: a taken conditional branch costs +1 cycle (the
-                        # block const charged the not-taken base). Native mode;
-                        # the emulation-only page-cross +1 is omitted (SNES game
+                        # block const charged the not-taken base), an internal
+                        # cycle at 6 master clocks. Native mode; the
+                        # emulation-only page-cross +1 is omitted (SNES game
                         # code runs e=0).
                         lines.append(
                             f"if ({pred}) {{ cpu->cycles += 1; "
-                            f"cpu->master_cycles += {_blk_spd_expr}; {target_stmt} }}")
+                            f"cpu->master_cycles += 6; {target_stmt} }}")
                     if fall is not None:
                         lines.append(_goto_or_return(fall, source_pc24=blk_pc24)
                                      + " /* fall-through */")
@@ -1606,7 +1691,8 @@ def emit_function(rom: bytes, bank: int, start: int,
                     # balanced (PHK+PER setup was skipped above).
                     insn = di_insn
                     if getattr(insn, 'dispatch_entries', None):
-                        from v2.codegen import _emit_dispatch
+                        from v2.codegen import _emit_dispatch, hw_data_charge_lines
+                        lines.extend(hw_data_charge_lines(insn))
                         for ln in _emit_dispatch(insn):
                             lines.append(ln)
                         block_terminated = True
@@ -1809,7 +1895,8 @@ def emit_function(rom: bytes, bank: int, start: int,
                     # are caught at v2_regen via graph.unresolved_indirects.
                     insn = di_insn
                     if getattr(insn, 'dispatch_entries', None):
-                        from v2.codegen import _emit_indirect_dispatch
+                        from v2.codegen import _emit_indirect_dispatch, hw_data_charge_lines
+                        lines.extend(hw_data_charge_lines(insn))
                         for ln in _emit_indirect_dispatch(insn):
                             lines.append(ln)
                         # Pointer-sourced CALL form (PEA <ret>; JMP (ptr)) is
@@ -1843,6 +1930,8 @@ def emit_function(rom: bytes, bank: int, start: int,
                                     ret_key = DecodeKey(
                                         (bank << 16) | ret_pc,
                                         return_m, return_x, ())
+                                    from v2.codegen import hw_data_charge_lines
+                                    lines.extend(hw_data_charge_lines(insn))
                                     lines.append(
                                         f"{{ /* balanced pushed indirect "
                                         f"{'long' if frame_size == 3 else 'near'} call */")
@@ -1946,7 +2035,8 @@ def emit_function(rom: bytes, bank: int, start: int,
                     # Emit a switch instead of the literal stack
                     # push, otherwise the synthesized return address
                     # leaks onto the simulated SNES stack.
-                    from v2.codegen import _emit_indirect_dispatch
+                    from v2.codegen import _emit_indirect_dispatch, hw_data_charge_lines
+                    lines.extend(hw_data_charge_lines(di_insn))
                     for ln in _emit_indirect_dispatch(di_insn):
                         lines.append(ln)
                     block_terminated = True
@@ -1962,6 +2052,10 @@ def emit_function(rom: bytes, bank: int, start: int,
                     # (abs,X) dispatches are ordinary calls: the selected
                     # handler RTSes back to the next instruction.
                     insn = di_insn
+                    if (getattr(insn, 'dispatch_runtime', False)
+                            or getattr(insn, 'dispatch_entries', None)):
+                        from v2.codegen import hw_data_charge_lines
+                        lines.extend(hw_data_charge_lines(insn))
                     if getattr(insn, 'dispatch_runtime', False):
                         # Runtime-pointer JSR (abs,X) (WRAM handler pointer,
                         # not statically enumerable — SM enemy/PLM/eproj AI).
@@ -1993,6 +2087,15 @@ def emit_function(rom: bytes, bank: int, start: int,
                     # ReadReg, ALU, Read/Write, etc. — non-terminating.
                     for ln in emit_op(op, getattr(di_insn, 'addr', None)):
                         lines.append(ln)
+            # An MDMAEN store runs the DMA inside this instruction; check the
+            # frame deadline right after it instead of at the next block, so
+            # a frame ends at the first instruction boundary past it, as on
+            # hardware (two DMAs in one block once cut a frame 27 966 master
+            # clocks late). Only between two emitted instructions.
+            if (_writes_mdmaen(di_insn) and not block_terminated
+                    and ii + 1 < len(pairs) and (ii + 1) not in skip_emit_idx):
+                block_split_after.append(ii)
+                lines.append(_BUS_SPLIT_MARK)
         # NLR with no terminator IR (block IR was pure-PullReg, like
         # $01:A3CB's [PLA, PLA, fall-through]). The SKIP setter wasn't
         # injected during the per-insn loop because there was no
@@ -2088,6 +2191,9 @@ def emit_function(rom: bytes, bank: int, start: int,
                     f"0x{fall_pc24:06x}u, _entry_s, _hrv, false); "
                     f"/* truncated (no successor): interpret continuation, balanced */")
         block_lines[key] = lines
+        block_splits[key] = block_split_after
+    from v2.codegen import set_current_insn as _set_current_insn
+    _set_current_insn(None)
 
     # Compose the function source with labels per block.
     src: List[str] = []
@@ -2255,17 +2361,61 @@ def emit_function(rom: bytes, bank: int, start: int,
         # Axis-2: charge this block's static 65816 CPU cycles as one constant
         # add (recompiler/snes_cycles.py). Near-free. Runtime-only modifiers
         # (D.l/page-cross/branch-taken) are charged dynamically in block_lines.
-        # Axis-5: also charge the region-weighted MASTER clocks (CPU cycles x
-        # code-region speed) into cpu->master_cycles, which paces the SPC700.
-        _cyc_const = _block_cycle_const(block_per_insn_ir.get(key, []))
-        if _cyc_const:
-            src.append(f'    cpu->cycles += {_cyc_const};')
-            _spd_expr, _spd_const = _block_speed(bank, key.pc)
-            if _spd_const is not None:
-                src.append(f'    cpu->master_cycles += {_cyc_const * _spd_const};')
-            else:
-                src.append(f'    cpu->master_cycles += {_cyc_const} * {_spd_expr};')
+        # Master clocks, bus-accurate (snes_cycles.py "Bus split"): the
+        # constant holds the opcode/operand fetches at the code-region speed
+        # and the internal cycles at 6; every data transfer is priced at its
+        # own address by the paced accessors in block_lines. An MDMAEN store
+        # splits the constant into segments (see _writes_mdmaen).
+        _pairs = block_per_insn_ir.get(key, [])
+        _skips = block_skip_idx.get(key, set())
+        _cuts = block_splits.get(key, [])
+        _spd_expr, _spd_const = _block_speed(bank, key.pc)
+        _segments = []
+        _seg_start = 0
+        for _end in [*_cuts, len(_pairs) - 1]:
+            _seg = _pairs[_seg_start:_end + 1]
+            _f = _i = 0
+            for _j, (_ins, _ops) in enumerate(_seg, start=_seg_start):
+                _ff, _ii = _insn_bus_split(_ins, elided_data=_j in _skips)
+                _f += _ff
+                _i += _ii
+            _next_pc24 = None
+            if _end + 1 < len(_pairs):
+                _nx = _pairs[_end + 1][0]
+                _next_pc24 = getattr(_nx, 'addr', None)
+            _segments.append((_block_cycle_const(_seg), _f, _i, _next_pc24))
+            _seg_start = _end + 1
+
+        def _segment_charge(seg, indent='    '):
+            out = []
+            cyc, f, i, _ = seg
+            if cyc:
+                out.append(f'{indent}cpu->cycles += {cyc};')
+            m_expr = _master_charge_expr(f, i, _spd_expr, _spd_const)
+            if m_expr is not None:
+                out.append(f'{indent}cpu->master_cycles += {m_expr};'
+                           f'  /* {f} fetch at code speed, {i} internal at 6 */')
+            return out
+
+        src.extend(_segment_charge(_segments[0]))
+        _seg_no = 0
         for ln in block_lines[key]:
+            if ln == _BUS_SPLIT_MARK:
+                _seg_no += 1
+                _nx24 = _segments[_seg_no - 1][3]
+                if _nx24 is None:
+                    raise AssertionError(
+                        f'{func_name}: MDMAEN split without a next instruction')
+                src.append('    /* MDMAEN store: the DMA ran; end the frame here if due */')
+                src.append('    if (interp_bridge_lle_master_deadline_reached(cpu)) {')
+                src.append('      RecompStackPopYield();')
+                src.append(
+                    f'      return interp_bridge_lle_yield_unwind('
+                    f'cpu, {_transfer_target_expr(_nx24 & 0xFFFFFF, False)});')
+                src.append('    }')
+                src.append('    cpu->coprocessor_master_cycles = cpu->master_cycles;')
+                src.extend(_segment_charge(_segments[_seg_no]))
+                continue
             # Inject a stack-auditor pop before any return so the shadow
             # stack stays balanced. An LLE yield unwind is NOT a return: the
             # bounce site resumes the interpreter mid-routine with pushed

@@ -439,6 +439,123 @@ def block_static_cycles(items, e: int = 0):
 
 
 # ==============================================================================
+# Bus split (fetch, data, internal) for bus-accurate master-clock pricing
+# ==============================================================================
+#
+# A 65816 cycle is one of three kinds, and the SNES prices each differently:
+#   fetch     opcode and operand bytes, read at PB:PC   -> code region speed
+#   data      operand, pointer, stack and vector bytes  -> speed of their address
+#   internal  no bus transfer (IO cycle)                -> 6 master clocks
+# The interpreter (interp_bridge.c) charges exactly this: every bus transfer at
+# its region speed and the remaining cycles at 6. Generated code reproduces it
+# by charging fetch and internal cycles as a per-block constant and every data
+# transfer through the paced bus accessors (cpu_read8_paced etc.), so the data
+# cycles must be counted here exactly as the hardware performs them.
+#
+# Counts are the static case (native mode, the instruction's known M/X, D.l=0,
+# no page cross, branch not taken). The runtime-only modifiers are all internal
+# cycles. MVN/MVP are per byte (3 fetches, a read, a write, 2 internal).
+
+# Data bytes of opcodes whose transfers are not an addressing-mode operand.
+# Values are (fixed bytes, plus bytes per accumulator width, plus bytes per
+# index width): PHA pushes 1 or 2 bytes, JSR pushes the 2-byte return address.
+_DATA_SPECIAL = {
+    0x4C: (0, 0, 0),   # JMP abs
+    0x5C: (0, 0, 0),   # JML long
+    0x6C: (2, 0, 0),   # JMP (abs): pointer from bank 0
+    0x7C: (2, 0, 0),   # JMP (abs,X): pointer from PB
+    0xDC: (3, 0, 0),   # JML [abs]: long pointer from bank 0
+    0x20: (2, 0, 0),   # JSR abs: push PCH, PCL
+    0xFC: (4, 0, 0),   # JSR (abs,X): push PCH, PCL, pointer lo, hi
+    0x22: (3, 0, 0),   # JSL: push PB, PCH, PCL
+    0x60: (2, 0, 0),   # RTS: pull PCL, PCH
+    0x6B: (3, 0, 0),   # RTL: pull PCL, PCH, PB
+    0x40: (4, 0, 0),   # RTI (native): pull P, PCL, PCH, PB
+    0x00: (6, 0, 0),   # BRK (native): push PB, PCH, PCL, P; vector lo, hi
+    0x02: (6, 0, 0),   # COP (native)
+    0xF4: (2, 0, 0),   # PEA: push 2
+    0xD4: (4, 0, 0),   # PEI: pointer from DP, push 2
+    0x62: (2, 0, 0),   # PER: push 2
+    0x48: (0, 1, 0),   # PHA
+    0x68: (0, 1, 0),   # PLA
+    0xDA: (0, 0, 1),   # PHX
+    0xFA: (0, 0, 1),   # PLX
+    0x5A: (0, 0, 1),   # PHY
+    0x7A: (0, 0, 1),   # PLY
+    0x08: (1, 0, 0),   # PHP
+    0x28: (1, 0, 0),   # PLP
+    0x8B: (1, 0, 0),   # PHB
+    0xAB: (1, 0, 0),   # PLB
+    0x4B: (1, 0, 0),   # PHK
+    0x0B: (2, 0, 0),   # PHD
+    0x2B: (2, 0, 0),   # PLD
+    0x44: (2, 0, 0),   # MVP: read source, write destination (per byte)
+    0x54: (2, 0, 0),   # MVN
+}
+
+# Pointer bytes read before the operand by the indirect addressing modes.
+_POINTER_BYTES = {DP_INDIR: 2, INDIR_DPX: 2, INDIR_Y: 2, STK_IY: 2,
+                  INDIR_L: 3, INDIR_LY: 3}
+
+
+def instr_length(op: int, m: int = 1, x: int = 1) -> int:
+    """Bytes of opcode `op` (opcode plus operand) at widths m/x."""
+    spec = _d.opcode_table()[op][2]
+    return spec(m, x) if callable(spec) else spec
+
+
+def fetch_cycles(op: int, m: int = 1, x: int = 1) -> int:
+    """Cycles that fetch the opcode and operand bytes at PB:PC (code speed).
+
+    Every instruction byte is read in its own cycle, so this is the length.
+    MVN/MVP refetch their 3 bytes for every byte moved (per-byte count).
+    """
+    return instr_length(op, m, x)
+
+
+def data_cycles(op: int, m: int = 1, x: int = 1) -> int:
+    """Data bus transfers (bytes) of one execution of `op`, static case.
+
+    Data = every transfer that is not an instruction fetch: memory operands,
+    indirect pointers, stack pushes and pulls, interrupt vectors.
+    """
+    wa = 1 if m else 2
+    wx = 1 if x else 2
+    if op in _DATA_SPECIAL:
+        fixed, per_a, per_x = _DATA_SPECIAL[op]
+        return fixed + per_a * wa + per_x * wx
+    mn, mode = _info(op)
+    if mode in (IMP, ACC, IMM, REL, REL16):
+        return 0
+    w = wx if mn in _X_WIDTH_MNEMS else wa
+    if mn in _RMW_MNEMS:
+        return 2 * w                       # read, then write back
+    return _POINTER_BYTES.get(mode, 0) + w
+
+
+def internal_cycles(op: int, m: int = 1, x: int = 1, e: int = 0) -> int:
+    """Internal (bus-idle) cycles of `op`, static case: the rest of the
+    instruction's cycles after its fetches and data transfers."""
+    return (instr_static_cycles(op, m, x, e)
+            - fetch_cycles(op, m, x) - data_cycles(op, m, x))
+
+
+def block_bus_split(items, e: int = 0):
+    """Fold a block to (fetch, data, internal) cycle totals.
+
+    `items` is an iterable of (op, m_flag, x_flag), as for
+    block_static_cycles. fetch + data + internal == the block's static
+    CPU cycles.
+    """
+    fetch = data = internal = 0
+    for op, m_flag, x_flag in items:
+        fetch += fetch_cycles(op, m_flag, x_flag)
+        data += data_cycles(op, m_flag, x_flag)
+        internal += internal_cycles(op, m_flag, x_flag, e)
+    return fetch, data, internal
+
+
+# ==============================================================================
 # C header generation (keeps the runtime/reference engine drift-free)
 # ==============================================================================
 

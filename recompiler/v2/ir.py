@@ -116,6 +116,10 @@ class Read(IROp):
     seg: SegRef
     width: int               # 1 or 2 bytes
     out: Value
+    # True when the bytes are instruction bytes (an operand read back from
+    # PB:PC+1, see emit_function `live_operand`): the CPU fetches them, so the
+    # block's fetch charge already covers them and the read is not paced.
+    fetch: bool = False
 
 
 @dataclass(frozen=True)

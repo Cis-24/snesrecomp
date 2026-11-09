@@ -50,9 +50,11 @@ static uint32_t read_vector(uint32_t addr) {
   return (hi << 8) | lo;
 }
 
+/* Native-mode vector locations (the frame driver runs native-mode games). */
+#define BFD_NMI_VECTOR 0x00FFEAu
+#define BFD_IRQ_VECTOR 0x00FFEEu
+
 static uint32_t reset_vector(void) { return read_vector(0x00FFFCu); }
-static uint32_t nmi_vector(void) { return read_vector(0x00FFEAu); }
-static uint32_t irq_vector(void) { return read_vector(0x00FFEEu); }
 
 static void update_resume_pc(void) {
   uint32_t resume = interp_bridge_lle_resume_pc();
@@ -124,13 +126,31 @@ static void advance_parked(uint64_t until) {
   cart_sync_coprocessors(g_snes->cart, g_cpu.master_cycles);
 }
 
-static void run_interrupt(uint32_t vector, uint64_t deadline) {
+/* The hardware cost of taking an interrupt: 2 internal cycles, the pushes
+ * (PB, PCH, PCL, P native; PCH, PCL, P in emulation mode) and the two vector
+ * reads, each bus transfer at the speed of its address. That is 8 CPU cycles
+ * in native mode, as the interpreter (interp816 doInterrupt) and the hardware
+ * charge them. Called after the push, so the frame sits at S+1 and up. */
+static void charge_interrupt_entry(uint32_t vector_addr) {
+  const unsigned pushed = g_cpu.emulation ? 3u : 4u;
+  uint64_t master = 2u * 6u;
+  for (unsigned k = 1; k <= pushed; ++k)
+    master += cpu_bus_speed(0x00, (uint16)(g_cpu.S + k));
+  master += cpu_bus_speed((uint8)(vector_addr >> 16), (uint16)vector_addr);
+  master += cpu_bus_speed((uint8)(vector_addr >> 16), (uint16)(vector_addr + 1u));
+  g_cpu.cycles += 2u + pushed + 2u;
+  g_cpu.master_cycles += master;
+}
+
+static void run_interrupt(uint32_t vector_addr, uint64_t deadline) {
   /* The beam keeps running through the handler, as on hardware. A held beam
    * cannot satisfy a handler that polls it -- Doom's reads OPVCT to choose its
    * split, then waits for H-blank -- and the handler spins to the step cap.
    * The bridge yields at the instruction that latched the IRQ, so the handler
    * already starts where the real CPU would take it. */
+  const uint32_t vector = read_vector(vector_addr);
   cpu_push_interrupt_frame_at(&g_cpu, s_resume_pc);
+  charge_interrupt_entry(vector_addr);
   interp_bridge_set_master_deadline(deadline);
   (void)interp_bridge_run_interrupt(&g_cpu, vector);
   /* A deadline left armed stays true for every AOT block prologue afterwards
@@ -188,7 +208,7 @@ void snes_beam_frame_driver_run_frame(void) {
     }
     g_snes->inNmi = true;
     s_wai_halted = false;
-    run_interrupt(nmi_vector(), frame_end);
+    run_interrupt(BFD_NMI_VECTOR, frame_end);
     g_snes->inNmi = false;
   }
 
@@ -224,7 +244,7 @@ void snes_beam_frame_driver_run_frame(void) {
       break;
     if (irq_wanted()) {
       s_wai_halted = false;
-      run_interrupt(irq_vector(), frame_end);
+      run_interrupt(BFD_IRQ_VECTOR, frame_end);
       continue;
     }
     /* Pay the beam what it owes first: those clocks can latch the next

@@ -95,6 +95,18 @@ def _trace_pc_arg() -> str:
     return f"0x{_CURRENT_SOURCE_PC24 & 0xFFFFFF:06x}u"
 
 
+# Decoded instruction whose IR ops are being emitted (emit_function sets it
+# per instruction). Read-only context for cycle charges that depend on the
+# instruction rather than on one IR op: the (dp),Y page-cross cycle exists
+# only for a read at index width 8, which a Read op alone does not say.
+_CURRENT_INSN = None
+
+
+def set_current_insn(insn) -> None:
+    global _CURRENT_INSN
+    _CURRENT_INSN = insn
+
+
 # Per-RTS/RTL-site flag: populated by the post-lowering stack-delta
 # analyser (see decoder.analyze_function_trampoline_returns). When a
 # Return op's source_pc24 is in this set, `_emit_return` emits the
@@ -492,7 +504,8 @@ from v2.ir import (  # noqa: E402
     Transfer, XBA, Nop, Break, Stop, PushEffectiveAddress,
     Reg, SegRef, SegKind, Value,
 )
-from snes65816 import INDIR, INDIR_X  # noqa: E402
+from snes65816 import INDIR, INDIR_X, INDIR_Y  # noqa: E402
+from snes_cycles import data_cycles as _hw_data_cycles  # noqa: E402
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -626,17 +639,91 @@ def _segref_addr_expr(seg: SegRef) -> tuple:
     raise ValueError(f"unsupported SegKind {k}")
 
 
+def _segref_access(seg: SegRef, tag: str) -> tuple:
+    """Resolve a SegRef for a data access: (pre_lines, bank_expr, addr_expr).
+
+    Like _segref_addr_expr, but an indirect mode reads its pointer ONCE, into
+    temporaries named after `tag` (declared by pre_lines), instead of
+    embedding the pointer read in both the bank and the address expression.
+    The pointer bytes are data transfers on hardware, so they go through the
+    paced accessors: lo, hi (and bank) in bus order.
+    """
+    k = seg.kind
+    if k in (SegKind.DIRECT, SegKind.ABS_BANK, SegKind.LONG, SegKind.STACK):
+        bank, addr = _segref_addr_expr(seg)
+        return ([], bank, addr)
+    idx = ""
+    if seg.index == Reg.X:
+        idx = " + cpu->X"
+    elif seg.index == Reg.Y:
+        idx = " + cpu->Y"
+    ptr = f"_ip{tag}"
+    if k == SegKind.DP_INDIRECT:
+        # ((D + dp) word) (+ Y), DB bank.
+        pre = [f"uint16 {ptr} = cpu_read16_paced(cpu, 0x00, "
+               f"(uint16)(cpu->D + {seg.offset:#06x}));"]
+        return (pre, "cpu->DB", f"(uint16)({ptr}{idx})")
+    if k == SegKind.DP_INDIRECT_LONG:
+        # ((D + dp) long) (+ Y). The indexed form adds Y to the full 24-bit
+        # pointer, carry into the bank included (see _segref_addr_expr).
+        ptr_addr = f"(uint16)(cpu->D + {seg.offset:#06x})"
+        pb = f"_ib{tag}"
+        pre = [f"uint16 {ptr} = cpu_read16_paced(cpu, 0x00, {ptr_addr});",
+               f"uint8 {pb} = cpu_read8_paced(cpu, 0x00, (uint16)({ptr_addr} + 2));"]
+        if seg.index is None:
+            return (pre, pb, ptr)
+        idx_reg = "cpu->X" if seg.index == Reg.X else "cpu->Y"
+        eff24 = f"((((uint32){pb} << 16) | (uint32){ptr}) + (uint32){idx_reg})"
+        return (pre, f"(uint8)(({eff24}) >> 16)", f"(uint16)({eff24})")
+    if k == SegKind.DP_INDIRECT_X:
+        pre = [f"uint16 {ptr} = cpu_read16_paced(cpu, 0x00, "
+               f"(uint16)(cpu->D + {seg.offset:#06x} + cpu->X));"]
+        return (pre, "cpu->DB", ptr)
+    if k == SegKind.STACK_REL_INDIRECT_Y:
+        pre = [f"uint16 {ptr} = cpu_read16_paced(cpu, 0x00, "
+               f"(uint16)(cpu->S + {seg.offset:#06x}));"]
+        return (pre, "cpu->DB", f"(uint16)({ptr} + cpu->Y)")
+    raise ValueError(f"_segref_access: {k} is not a data operand")
+
+
+def _indirect_y_cross_lines(seg: SegRef, tag: str) -> List[str]:
+    """(dp),Y read at index width 8: +1 internal cycle when pointer + Y
+    leaves the pointer's page (W65C816S note 4; interp816 adrIdy). At
+    index width 16 the cycle is always taken and is in the static count."""
+    insn = _CURRENT_INSN
+    if (insn is None or seg.kind != SegKind.DP_INDIRECT or seg.index != Reg.Y
+            or getattr(insn, 'mode', None) != INDIR_Y
+            or not (getattr(insn, 'x_flag', 1) & 1)):
+        return []
+    ptr = f"_ip{tag}"
+    return [f"if (({ptr} & 0xFF00) != ((uint16)({ptr} + cpu->Y) & 0xFF00)) "
+            f"{{ cpu->cycles += 1; cpu->master_cycles += 6; }}"
+            f"  /* (dp),Y read page-cross */"]
+
+
 # ── Per-op handlers ─────────────────────────────────────────────────────────
 
 def _emit_read(op: Read) -> List[str]:
-    bank, addr = _segref_addr_expr(op.seg)
-    return [f"{widths.ctype(op.width)} {_v(op.out)} = "
-            f"{widths.read_fn(op.width)}(cpu, {bank}, {addr});"]
+    if getattr(op, 'fetch', False):
+        # Instruction bytes read back from the program bank: the block's
+        # fetch charge already prices them.
+        bank, addr = _segref_addr_expr(op.seg)
+        return [f"{widths.ctype(op.width)} {_v(op.out)} = "
+                f"{widths.read_fn(op.width)}(cpu, {bank}, {addr});"]
+    tag = str(op.out.vid)
+    pre, bank, addr = _segref_access(op.seg, tag)
+    return [*pre, *_indirect_y_cross_lines(op.seg, tag),
+            f"{widths.ctype(op.width)} {_v(op.out)} = "
+            f"{widths.paced_read_fn(op.width)}(cpu, {bank}, {addr});"]
 
 
 def _emit_write(op: Write) -> List[str]:
-    bank, addr = _segref_addr_expr(op.seg)
-    return [f"{widths.write_fn(op.width)}(cpu, {bank}, {addr}, {_v(op.src)});"]
+    pre, bank, addr = _segref_access(op.seg, "w")
+    call = (f"{widths.paced_write_fn(op.width)}(cpu, {bank}, {addr}, "
+            f"{_v(op.src)});")
+    if not pre:
+        return [call]
+    return ["{", *(f"  {ln}" for ln in pre), f"  {call}", "}"]
 
 
 def _emit_readreg(op: ReadReg) -> List[str]:
@@ -912,14 +999,15 @@ def _emit_incmem(op: IncMem) -> List[str]:
     """INC/DEC memory: result = mem + delta (no carry-in); set Z/N from
     result; leave C and V untouched. 65816 hw spec for INC/DEC abs/dp.
     Distinct from ADC/SBC (Alu.ADD/SUB) which DO carry-in and update C/V."""
-    bank, addr = _segref_addr_expr(op.seg)
+    pre, bank, addr = _segref_access(op.seg, "m")
     delta = "+1" if op.delta == +1 else "-1"
     ctype = widths.ctype(op.width)
     lines = [
         "{",
-        f"  {ctype} _im = {widths.read_fn(op.width)}(cpu, {bank}, {addr});",
+        *(f"  {ln}" for ln in pre),
+        f"  {ctype} _im = {widths.paced_read_fn(op.width)}(cpu, {bank}, {addr});",
         f"  _im = ({ctype})(_im {delta});",
-        f"  {widths.write_fn(op.width)}(cpu, {bank}, {addr}, _im);",
+        f"  {widths.paced_write_fn(op.width)}(cpu, {bank}, {addr}, _im);",
     ]
     lines.extend(f"  {s}" for s in widths.set_nz_no_p("_im", op.width))
     lines.append("}")
@@ -954,25 +1042,27 @@ def _emit_bittest(op: BitTest) -> List[str]:
 
 
 def _emit_bitsetmem(op: BitSetMem) -> List[str]:
-    bank, addr = _segref_addr_expr(op.seg)
+    pre, bank, addr = _segref_access(op.seg, "m")
     ctype = widths.ctype(op.width)
     return [
         "{",
-        f"  {ctype} _m = {widths.read_fn(op.width)}(cpu, {bank}, {addr});",
+        *(f"  {ln}" for ln in pre),
+        f"  {ctype} _m = {widths.paced_read_fn(op.width)}(cpu, {bank}, {addr});",
         f"  cpu->_flag_Z = ((_m & cpu->A) == 0) ? 1 : 0;",
-        f"  {widths.write_fn(op.width)}(cpu, {bank}, {addr}, ({ctype})(_m | cpu->A));",
+        f"  {widths.paced_write_fn(op.width)}(cpu, {bank}, {addr}, ({ctype})(_m | cpu->A));",
         "}",
     ]
 
 
 def _emit_bitclearmem(op: BitClearMem) -> List[str]:
-    bank, addr = _segref_addr_expr(op.seg)
+    pre, bank, addr = _segref_access(op.seg, "m")
     ctype = widths.ctype(op.width)
     return [
         "{",
-        f"  {ctype} _m = {widths.read_fn(op.width)}(cpu, {bank}, {addr});",
+        *(f"  {ln}" for ln in pre),
+        f"  {ctype} _m = {widths.paced_read_fn(op.width)}(cpu, {bank}, {addr});",
         f"  cpu->_flag_Z = ((_m & cpu->A) == 0) ? 1 : 0;",
-        f"  {widths.write_fn(op.width)}(cpu, {bank}, {addr}, ({ctype})(_m & ~cpu->A));",
+        f"  {widths.paced_write_fn(op.width)}(cpu, {bank}, {addr}, ({ctype})(_m & ~cpu->A));",
         "}",
     ]
 
@@ -1382,6 +1472,65 @@ def _live_dispatch_target_expr(insn) -> Optional[str]:
                 f"| (uint32)cpu_read16(cpu, cpu->PB, {offset}))")
     return (f"(((uint32)cpu->PB << 16) "
             f"| (uint32)cpu_read16(cpu, cpu->PB, {offset}))")
+
+
+def hw_data_charge_lines(insn) -> List[str]:
+    """Bus time of the data transfers of a dispatching instruction.
+
+    The dispatch emitters (indirect JMP/JML/JSR switches, inlined helper
+    calls, stack dispatches that replace a push) model the instruction's data
+    transfers without performing them through the paced accessors: they read
+    the pointer for a switch, call through a runtime helper, or drop the push
+    altogether. The block constant leaves data cycles out, so the dispatch
+    site charges them here, once, from the registers before the instruction,
+    at the address each transfer uses on hardware. The emitted dispatch code
+    then keeps its own reads unpaced.
+    """
+    op = getattr(insn, 'opcode', None)
+    if op is None:
+        return []
+    m = getattr(insn, 'm_flag', 1) & 1
+    x = getattr(insn, 'x_flag', 1) & 1
+    ptr = (getattr(insn, 'operand', 0) or 0) & 0xFFFF
+
+    def push(n):
+        return [f"cpu_bus_charge(cpu, 0x00, (uint16)(cpu->S - {k}u));"
+                for k in range(n)]
+
+    def bank0(n):
+        return [f"cpu_bus_charge(cpu, 0x00, (uint16)0x{(ptr + k) & 0xFFFF:04x});"
+                for k in range(n)]
+
+    def pb_indexed(n):
+        return [f"cpu_bus_charge(cpu, cpu->PB, (uint16)(0x{ptr:04x} + cpu->X + {k}u));"
+                for k in range(n)]
+
+    if op in (0x4C, 0x5C):          # JMP abs / JML long: no data
+        body = []
+    elif op == 0x6C:                # JMP (abs)
+        body = bank0(2)
+    elif op == 0xDC:                # JML [abs]
+        body = bank0(3)
+    elif op == 0x7C:                # JMP (abs,X)
+        body = pb_indexed(2)
+    elif op == 0xFC:                # JSR (abs,X): push PCH, PCL, then pointer
+        body = push(2) + pb_indexed(2)
+    elif op == 0x20:                # JSR abs (inline-table helper)
+        body = push(2)
+    elif op == 0x22:                # JSL (inline-table helper)
+        body = push(3)
+    elif op in (0x48, 0xDA, 0x5A, 0x08, 0x8B, 0x4B, 0x0B, 0xF4, 0x62):
+        body = push(_hw_data_cycles(op, m, x))   # stack dispatch push
+    elif op == 0xD4:                # PEI: pointer from DP, then push 2
+        body = ([f"cpu_bus_charge(cpu, 0x00, (uint16)(cpu->D + 0x{ptr & 0xFF:02x} + {k}u));"
+                 for k in range(2)] + push(2))
+    else:
+        raise ValueError(
+            f"hw_data_charge_lines: no bus model for dispatch opcode "
+            f"${op:02X} at ${getattr(insn, 'addr', 0) & 0xFFFFFF:06X}")
+    if not body:
+        return []
+    return ["/* bus time of the instruction's data transfers */", *body]
 
 
 def _transfer_target_expr(pc24: int, long: bool) -> str:
@@ -2196,16 +2345,16 @@ def _emit_return_frame_push(op: 'Call') -> List[str]:
         pbr = "cpu->PB" if site is not None else "0xff"
         return [
             "  /* JSL return frame -> cpu->S (Option-1) */",
-            f"  cpu_write8(cpu, 0x00, cpu->S, {pbr}); cpu->S = (uint16)(cpu->S - 1);",
-            f"  cpu_write8(cpu, 0x00, cpu->S, 0x{(ret16 >> 8) & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);",
-            f"  cpu_write8(cpu, 0x00, cpu->S, 0x{ret16 & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);",
+            f"  cpu_write8_paced(cpu, 0x00, cpu->S, {pbr}); cpu->S = (uint16)(cpu->S - 1);",
+            f"  cpu_write8_paced(cpu, 0x00, cpu->S, 0x{(ret16 >> 8) & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);",
+            f"  cpu_write8_paced(cpu, 0x00, cpu->S, 0x{ret16 & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);",
             "  cpu->host_return_valid = 3;  /* paired host caller, JSL frame */",
         ]
     ret16 = ((site + 2) & 0xFFFF) if site is not None else 0xFFFF
     return [
         "  /* JSR return frame -> cpu->S (Option-1) */",
-        f"  cpu_write8(cpu, 0x00, cpu->S, 0x{(ret16 >> 8) & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);",
-        f"  cpu_write8(cpu, 0x00, cpu->S, 0x{ret16 & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);",
+        f"  cpu_write8_paced(cpu, 0x00, cpu->S, 0x{(ret16 >> 8) & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);",
+        f"  cpu_write8_paced(cpu, 0x00, cpu->S, 0x{ret16 & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);",
         "  cpu->host_return_valid = 2;  /* paired host caller, JSR frame */",
     ]
 
@@ -2459,9 +2608,11 @@ def _emit_return(op: Return) -> List[str]:
         # I_NMI/I_IRQ invocation; without that push this over-pops cpu->S.
         return [
             "cpu_trace_event(cpu, 0, CPU_TR_RTI, 0, 0);",
-            "{ cpu->S = (uint16)(cpu->S + 1); cpu->P = cpu_read8(cpu, 0x00, cpu->S); cpu_p_to_mirrors(cpu);",
-            "  cpu->S = (uint16)(cpu->S + 2);  /* pull + discard PC */",
-            "  if (!cpu->emulation) cpu->S = (uint16)(cpu->S + 1);  /* native: pull + discard PB */",
+            "{ cpu->S = (uint16)(cpu->S + 1); cpu->P = cpu_read8_paced(cpu, 0x00, cpu->S); cpu_p_to_mirrors(cpu);",
+            "  /* pull + discard PC (and PB): the bus reads still take their time */",
+            "  cpu_bus_charge(cpu, 0x00, (uint16)(cpu->S + 1)); cpu_bus_charge(cpu, 0x00, (uint16)(cpu->S + 2));",
+            "  cpu->S = (uint16)(cpu->S + 2);",
+            "  if (!cpu->emulation) { cpu_bus_charge(cpu, 0x00, (uint16)(cpu->S + 1)); cpu->S = (uint16)(cpu->S + 1); }",
             "  cpu_trace_px_record(cpu, 0, 3 /*RTI*/, cpu->P, cpu->P);",
             "  return RECOMP_RETURN_NORMAL; /* RTI: popped interrupt frame */ }",
         ]
@@ -2490,13 +2641,13 @@ def _emit_return(op: Return) -> List[str]:
     lines = [
         f"{{ uint16 _ret_s = cpu->S;  /* {label_inner} pop hardware return frame */",
         "  cpu->S = (uint16)(cpu->S + 1);",
-        "  uint16 _rpcl = (uint16)cpu_read8(cpu, 0x00, cpu->S);",
+        "  uint16 _rpcl = (uint16)cpu_read8_paced(cpu, 0x00, cpu->S);",
         "  cpu->S = (uint16)(cpu->S + 1);",
-        "  uint16 _rpch = (uint16)cpu_read8(cpu, 0x00, cpu->S);",
+        "  uint16 _rpch = (uint16)cpu_read8_paced(cpu, 0x00, cpu->S);",
     ]
     if op.long:
         lines.append("  cpu->S = (uint16)(cpu->S + 1);")
-        lines.append("  uint8 _rpb = cpu_read8(cpu, 0x00, cpu->S);")
+        lines.append("  uint8 _rpb = cpu_read8_paced(cpu, 0x00, cpu->S);")
     else:
         lines.append("  uint8 _rpb = cpu->PB;")
     # Frame size this RTS/RTL pops (RTS = 2 bytes, RTL = 3). The dispatch
@@ -2651,8 +2802,10 @@ def _emit_break(op: Break) -> List[str]:
         # brk_rti: BRK pushes PB, the address past its signature byte and P
         # (native mode), sets I and clears D; the vector's bare RTI pulls the
         # same four bytes. What stays is the bytes left below S and the time:
-        # the BRK's cycles are the block's, the RTI's 7 (6 + 1 native) are
-        # charged here at the speed of bank $00, where the vector points.
+        # the BRK's fetches and internal cycles are in the block constant, its
+        # four pushes and two vector reads are priced here, and so is the
+        # RTI's 7 (6 + 1 native): its fetch at the vector's target, two
+        # internal cycles and its four pulls.
         # Only the native vector ($FFE6) was validated: in emulation mode
         # BRK goes through $FFFE, so that case runs in the interpreter.
         site = op.source_pc24 & 0xFFFFFF
@@ -2665,12 +2818,15 @@ def _emit_break(op: Break) -> List[str]:
             "}",
             "{ uint16 _s = cpu->S;",
             "  cpu_mirrors_to_p(cpu);",
-            "  cpu_write8(cpu, 0x00, _s, cpu->PB);",
-            f"  cpu_write8(cpu, 0x00, (uint16)(_s - 1), 0x{ret >> 8:02x});",
-            f"  cpu_write8(cpu, 0x00, (uint16)(_s - 2), 0x{ret & 0xFF:02x});",
-            "  cpu_write8(cpu, 0x00, (uint16)(_s - 3), (uint8)cpu->P);",
-            "  cpu->cycles += 7;",
-            "  cpu->master_cycles += 7 * 8; }",
+            "  cpu_write8_paced(cpu, 0x00, _s, cpu->PB);",
+            f"  cpu_write8_paced(cpu, 0x00, (uint16)(_s - 1), 0x{ret >> 8:02x});",
+            f"  cpu_write8_paced(cpu, 0x00, (uint16)(_s - 2), 0x{ret & 0xFF:02x});",
+            "  cpu_write8_paced(cpu, 0x00, (uint16)(_s - 3), (uint8)cpu->P);",
+            "  uint16 _rti = cpu_read16_paced(cpu, 0x00, 0xFFE6);  /* BRK vector */",
+            "  cpu->cycles += 7;  /* the vector's RTI */",
+            "  cpu->master_cycles += cpu_bus_speed(0x00, _rti) + 2 * 6;",
+            "  cpu_bus_charge(cpu, 0x00, (uint16)(_s - 3)); cpu_bus_charge(cpu, 0x00, (uint16)(_s - 2));",
+            "  cpu_bus_charge(cpu, 0x00, (uint16)(_s - 1)); cpu_bus_charge(cpu, 0x00, _s); }",
         ]
     if not op.tier_to_lle:
         return ["/* COP: software interrupt */" if op.cop
@@ -2697,16 +2853,16 @@ def _emit_pea_per_pei(op: PushEffectiveAddress) -> List[str]:
         return [
             "{ uint16 _old_s = cpu->S;",
             "  cpu->S = (uint16)(cpu->S - 1);",
-            f"  cpu_write16(cpu, 0x00, cpu->S, (uint16){op.seg.offset:#06x});",
+            f"  cpu_write16_paced(cpu, 0x00, cpu->S, (uint16){op.seg.offset:#06x});",
             "  cpu->S = (uint16)(cpu->S - 1);",
             "  cpu_trace_stack_op(cpu, 0, CPU_STACK_OP_PEA, _old_s, -2); }",
         ]
     if op.seg.kind == SegKind.DP_INDIRECT:
         return [
             "{ uint16 _old_s = cpu->S;",
-            f"  uint16 _peival = cpu_read16(cpu, 0x00, (uint16)(cpu->D + {op.seg.offset:#06x}));",
+            f"  uint16 _peival = cpu_read16_paced(cpu, 0x00, (uint16)(cpu->D + {op.seg.offset:#06x}));",
             "  cpu->S = (uint16)(cpu->S - 1);",
-            "  cpu_write16(cpu, 0x00, cpu->S, _peival);",
+            "  cpu_write16_paced(cpu, 0x00, cpu->S, _peival);",
             "  cpu->S = (uint16)(cpu->S - 1);",
             "  cpu_trace_stack_op(cpu, 0, CPU_STACK_OP_PEI, _old_s, -2); }",
         ]
@@ -2728,11 +2884,13 @@ def _emit_blockmove(op: BlockMove) -> List[str]:
         f"  cpu_trace_db_change(cpu, {trace_pc}, _old_db, _dst_b, {et});",
         "  /* MVN/MVP always transfer at least one byte. A is count-minus-one,",
         "   * and an interrupt resumes at this same opcode with the updated",
-        "   * A/X/Y/DB state. The block's static charge covers the first byte;",
-        "   * each repeated byte costs another seven CPU cycles. */",
+        "   * A/X/Y/DB state. The block's static charge covers the first byte's",
+        "   * fetches and internal cycles; each repeated byte costs another seven",
+        "   * CPU cycles (3 fetches, 2 internal). Every byte's read and write are",
+        "   * paced at their own addresses. */",
         "  do {",
-        "    uint8 _b = cpu_read8(cpu, _src_b, cpu->X);",
-        "    cpu_write8(cpu, _dst_b, cpu->Y, _b);",
+        "    uint8 _b = cpu_read8_paced(cpu, _src_b, cpu->X);",
+        "    cpu_write8_paced(cpu, _dst_b, cpu->Y, _b);",
         f"    cpu->X = (uint16)(cpu->X {delta});",
         f"    cpu->Y = (uint16)(cpu->Y {delta});",
         "    if (cpu->x_flag) { cpu->X &= 0x00FFu; cpu->Y &= 0x00FFu; }",
@@ -2742,7 +2900,7 @@ def _emit_blockmove(op: BlockMove) -> List[str]:
         f"        return interp_bridge_lle_yield_unwind(cpu, {_transfer_target_expr(_CURRENT_SOURCE_PC24, False)});",
         "      }",
         "      cpu->cycles += 7;",
-        f"      cpu->master_cycles += 7 * {speed_expr};",
+        f"      cpu->master_cycles += 3 * {speed_expr} + 2 * 6;",
         "    }",
         "  } while (cpu->A != 0xFFFF);",
         "}",

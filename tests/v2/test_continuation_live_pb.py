@@ -20,10 +20,13 @@ def test_emitted_wait_and_deadline_continuations_keep_live_bank(tmp_path):
                              func_name='Wait')
     # Execute the actual entry guards; both paths return before the body.
     entry = generated.split('  RecompReturn _pending_skip')[0] + '  assert(0); return 0;\n}\n'
-    # Execute an actual generated charge, including the live FastROM condition.
-    charge = re.search(r'cpu->master_cycles \+= (\d+) \* ([^;]+);', generated)
+    # Execute an actual generated charge, including the live FastROM condition:
+    # the block's fetches at the live code speed, its internal cycles at 6.
+    charge = re.search(r'cpu->master_cycles \+= (\d+) \* (\(\(g_memsel[^;]*?\) \? 6 : 8\))'
+                       r'(?: \+ (\d+))?;', generated)
     assert charge
-    cycles = int(charge[1])
+    fetch = int(charge[1])
+    internal = int(charge[3] or 0)
     source = r'''
 #include <assert.h>
 #include <stdint.h>
@@ -59,7 +62,7 @@ int main(void) {
                 cpu.master_cycles = 0;
                 charge(&cpu);
                 const unsigned expected_speed = (bank == 0x80 && g_memsel) ? 6 : 8;
-''' + f'                assert(cpu.master_cycles == {cycles} * expected_speed);\n' + r'''
+''' + f'                assert(cpu.master_cycles == {fetch} * expected_speed + {internal});\n' + r'''
             }
         }
     }

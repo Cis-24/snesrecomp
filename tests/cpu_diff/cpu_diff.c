@@ -13,6 +13,18 @@
  * host_return_valid=0 and subtract 2 from cpu->S after the call to recover the
  * opcode's true effect on S (works for stack ops too: TXS sets S then RTS pops).
  *
+ * Time: the interpreter also runs that RTS, and both sides are compared in CPU
+ * cycles and in master clocks. The interpreter's master clocks are priced as
+ * interp_bridge.c prices them: every bus transfer at the speed of its address,
+ * the remaining cycles at 6. The generated code must reach the same sum with
+ * its block constants (fetches at the code speed, internal cycles at 6), its
+ * paced data transfers and its dynamic extra cycles. Every test runs twice:
+ * code in slow bank $00 and in FastROM bank $80 with MEMSEL set, so a model
+ * that prices data or internal cycles at the code speed fails one of them.
+ *
+ * Sequences (OpTest.seq) are whole blocks and loops: the interpreter runs
+ * until it reaches the trailing RTS, then runs it.
+ *
  * Build/run: tests/cpu_diff/run.ps1 (mingw gcc on Windows).
  */
 #include <stdio.h>
@@ -65,15 +77,22 @@ void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
     RAM[mapa(a >> 16, a)] = (uint8)v;
     RAM[mapa((a + 1) >> 16, a + 1)] = (uint8)(v >> 8);
 }
+/* The interpreter's bus: every transfer is priced at its address. */
+static uint64_t s_bus_master, s_bus_transfers;
 static uint8_t i816_read(void *mem, uint32_t adr) {
+    s_bus_master += cpu_bus_speed((uint8)(adr >> 16), (uint16)adr);
+    s_bus_transfers++;
     return ((uint8_t *)mem)[mapa(adr >> 16, adr)];
 }
 static void i816_write(void *mem, uint32_t adr, uint8_t v) {
+    s_bus_master += cpu_bus_speed((uint8)(adr >> 16), (uint16)adr);
+    s_bus_transfers++;
     ((uint8_t *)mem)[mapa(adr >> 16, adr)] = v;
 }
 
 /* ── recomp runtime seam stubs (cpu_state.c / common_cpu_infra.c in prod) ── */
 CpuState g_cpu;
+uint8_t g_memsel;
 const char *g_last_recomp_func;
 int snes_frame_counter = 0;
 int g_recomp_stack_top = 0;
@@ -81,6 +100,7 @@ uint16_t g_cpu_entry_s[256];
 void RecompStackPush(const char *n) { (void)n; if (g_recomp_stack_top < 255) g_recomp_stack_top++; }
 void RecompStackPushInterpreter(const char *n) { RecompStackPush(n); }
 void RecompStackPop(void) { if (g_recomp_stack_top > 0) g_recomp_stack_top--; }
+void RecompStackPopYield(void) { RecompStackPop(); }
 void WatchdogCheck(void) {}
 int  cpu_resolve_ancestor_skip(uint16_t ret_s) { (void)ret_s; return -1; }
 int  cpu_take_tailcall_return_context(uint16_t *e, uint8_t *h) { (void)e; (void)h; return 0; }
@@ -130,6 +150,9 @@ typedef struct { uint16_t a, x, y, s, d; uint8_t db, C, Z, V, N, D, I; } St;
 
 static int d_fail = 0, d_checks = 0;
 
+/* FastROM pass: code runs in bank $80 with MEMSEL set (fetches at 6). */
+static int s_fast;
+
 static void run_one(const OpTest *op, const St *st, Interp816 *ip) {
     /* restore both buses to the reference pattern, then drop the opcode bytes
      * (identical in both) at $00:8000 — interp816 fetches them; the recomp has
@@ -137,8 +160,12 @@ static void run_one(const OpTest *op, const St *st, Interp816 *ip) {
     memcpy(&RAM[WRAM], REF, WSZ);
     memcpy(&RAM2[WRAM], REF, WSZ);
     if (op->far) { memcpy(&RAM[FAR], REFF, FSZ); memcpy(&RAM2[FAR], REFF, FSZ); }
-    memcpy(&RAM[0x8000], op->code, (size_t)op->len);   /* $00:8000 (not WRAM-mirrored) */
-    memcpy(&RAM2[0x8000], op->code, (size_t)op->len);
+    const uint8_t pb = s_fast ? 0x80 : 0x00;
+    const uint32_t code_at = ((uint32_t)pb << 16) | 0x8000u;  /* not WRAM-mirrored */
+    memcpy(&RAM[code_at], op->code, (size_t)op->len);
+    memcpy(&RAM2[code_at], op->code, (size_t)op->len);
+    RAM[code_at + (uint32_t)op->len] = RAM2[code_at + (uint32_t)op->len] = 0x60;  /* RTS */
+    g_memsel = (uint8_t)s_fast;
 
     /* index-addressed ops: bound X/Y so base+index stays in WRAM (<$2000). */
     uint16_t xv = op->idx ? (uint16_t)(st->x % 0xF00) : st->x;
@@ -161,7 +188,7 @@ static void run_one(const OpTest *op, const St *st, Interp816 *ip) {
     /* recomp side */
     memset(&g_cpu, 0, sizeof g_cpu);
     g_cpu.ram = RAM; g_cpu.A = st->a; g_cpu.X = xv; g_cpu.Y = yv;
-    g_cpu.S = st->s; g_cpu.D = st->d; g_cpu.DB = st->db; g_cpu.PB = 0;
+    g_cpu.S = st->s; g_cpu.D = st->d; g_cpu.DB = st->db; g_cpu.PB = pb;
     g_cpu.m_flag = op->m; g_cpu.x_flag = op->x; g_cpu.emulation = 0;
     g_cpu._flag_C = st->C; g_cpu._flag_Z = st->Z; g_cpu._flag_V = st->V;
     g_cpu._flag_N = st->N; g_cpu._flag_D = st->D; g_cpu._flag_I = st->I;
@@ -170,12 +197,28 @@ static void run_one(const OpTest *op, const St *st, Interp816 *ip) {
     op->fn(&g_cpu);
     g_cpu.S = (uint16)(g_cpu.S - 2);  /* undo the RTS frame pop */
 
-    /* interp816 side: same state, one opcode */
+    /* interp816 side: same state, the opcode (or the sequence up to its RTS) */
     ip->a = st->a; ip->x = xv; ip->y = yv; ip->sp = st->s; ip->dp = st->d;
-    ip->k = 0; ip->db = st->db; ip->pc = 0x8000; ip->e = false;
+    ip->k = pb; ip->db = st->db; ip->pc = 0x8000; ip->e = false;
     ip->c = st->C; ip->z = st->Z; ip->v = st->V; ip->n = st->N;
     ip->d = st->D; ip->i = st->I; ip->mf = op->m; ip->xf = op->x;
-    interp816_runOpcode(ip);
+    s_bus_master = s_bus_transfers = 0;
+    uint64_t icycles = (uint64_t)interp816_runOpcode(ip);
+    for (int guard = 0; op->seq && ip->pc != (uint16_t)(0x8000 + op->len); guard++) {
+        if (guard > 100000) { printf("  RUNAWAY %s\n", op->name); break; }
+        icycles += (uint64_t)interp816_runOpcode(ip);
+    }
+    /* Registers are compared after the opcode or sequence; time includes the
+     * trailing RTS on both sides. Save what the RTS would disturb. */
+    uint16_t ia = ip->a, ix = ip->x, iy = ip->y, isp = ip->sp, idp = ip->dp;
+    uint8_t idb = ip->db;
+    bool ic = ip->c, iz = ip->z, iv = ip->v, in_ = ip->n, id = ip->d,
+         imf = ip->mf, ixf = ip->xf;
+    icycles += (uint64_t)interp816_runOpcode(ip);       /* the RTS */
+    const uint64_t imaster = s_bus_master + (icycles - s_bus_transfers) * 6u;
+    ip->a = ia; ip->x = ix; ip->y = iy; ip->sp = isp; ip->dp = idp; ip->db = idb;
+    ip->c = ic; ip->z = iz; ip->v = iv; ip->n = in_; ip->d = id;
+    ip->mf = imf; ip->xf = ixf;
 
     /* diff registers + flags */
     d_checks++;
@@ -189,6 +232,8 @@ static void run_one(const OpTest *op, const St *st, Interp816 *ip) {
     CK("V", g_cpu._flag_V, ip->v); CK("N", g_cpu._flag_N, ip->n);
     CK("Df", g_cpu._flag_D, ip->d); CK("M", g_cpu.m_flag, ip->mf);
     CK("Xf", g_cpu.x_flag, ip->xf);
+    CK("CYC", g_cpu.cycles, icycles);
+    CK("MASTER", g_cpu.master_cycles, imaster);
     /* diff the memory window for store/RMW ops (skip $8000-2: the opcode bytes) */
     if (op->wmem) {
         uint32_t base = op->far ? FAR : WRAM, sz = op->far ? FSZ : WSZ;
@@ -201,8 +246,8 @@ static void run_one(const OpTest *op, const St *st, Interp816 *ip) {
     if (bad) {
         d_fail++;
         if (d_fail <= 40)
-            printf("  DIVERGE %-16s in:A=%04X X=%04X Y=%04X D=%04X DB=%X C%d Z%d V%d N%d D%d | r/i:%s\n",
-                   op->name, st->a, xv, yv, st->d, st->db,
+            printf("  DIVERGE %-16s %s in:A=%04X X=%04X Y=%04X D=%04X DB=%X C%d Z%d V%d N%d D%d | r/i:%s\n",
+                   op->name, s_fast ? "fast" : "slow", st->a, xv, yv, st->d, st->db,
                    st->C, st->Z, st->V, st->N, st->D, msg);
     }
 }
@@ -219,10 +264,12 @@ int main(void) {
     memset(per_op_fail, 0, sizeof per_op_fail);
 
     printf("=== 65816 codegen vs interp816 differential ===\n");
-    printf("opcodes: %d  iters/op: %d\n\n", g_nops, ITERS);
+    printf("opcodes: %d  iters/op: %d x 2 (slow bank $00, FastROM bank $80)\n\n",
+           g_nops, ITERS);
     for (int o = 0; o < g_nops; o++) {
         int f0 = d_fail;
-        for (int it = 0; it < ITERS; it++) {
+        for (int it = 0; it < 2 * ITERS; it++) {
+            s_fast = it & 1;
             St st;
             st.a = (uint16)rnd(); st.x = (uint16)rnd(); st.y = (uint16)rnd();
             /* D bounded so dp/dp,X EAs (D+dp+X, bounded index) stay in WRAM. */
@@ -238,7 +285,7 @@ int main(void) {
     int diverging = 0;
     for (int o = 0; o < g_nops && o < 4096; o++)
         if (per_op_fail[o]) { diverging++;
-            printf("  %-16s : %d/%d diverged\n", g_ops[o].name, per_op_fail[o], ITERS); }
+            printf("  %-16s : %d/%d diverged\n", g_ops[o].name, per_op_fail[o], 2 * ITERS); }
 
     printf("\n==== %d checks, %d divergences across %d/%d opcodes ====\n",
            d_checks, d_fail, diverging, g_nops);

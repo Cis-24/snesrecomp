@@ -6,7 +6,7 @@
  * executes, plus the (m,x) width context both run under. */
 typedef struct {
     const char *name;
-    uint8_t code[4];
+    uint8_t code[16];
     int len;
     RecompReturn (*fn)(CpuState *);
     uint8_t m, x;
@@ -18,6 +18,8 @@ typedef struct {
                     *   3 = 16-bit ptr at D+dp+X ((dp,X)) */
     uint8_t far;   /* 1 = long ($C0:FFF0-based): use the far window ($C0-$C1),
                     * which exercises ROM-bank addressing + long,X bank-carry */
+    uint8_t seq;   /* 1 = a multi-instruction sequence (loops included): the
+                    * interpreter runs until it reaches the trailing RTS */
 } OpTest;
 
 extern const OpTest g_ops[];

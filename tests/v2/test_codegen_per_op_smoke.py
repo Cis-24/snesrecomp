@@ -368,7 +368,11 @@ def test_blockmove_mvn_increments():
     assert "do {" in s
     assert "while (cpu->A != 0xFFFF)" in s
     assert "cpu->cycles += 7" in s
-    assert "cpu->master_cycles += 7 * ((g_memsel && (cpu->PB & 0x80)) ? 6 : 8)" in s
+    # Each repeated byte: 3 fetches at the code speed, 2 internal cycles at 6;
+    # its read and write are paced at their own addresses.
+    assert "cpu->master_cycles += 3 * ((g_memsel && (cpu->PB & 0x80)) ? 6 : 8) + 2 * 6" in s
+    assert "cpu_read8_paced(cpu, _src_b, cpu->X)" in s
+    assert "cpu_write8_paced(cpu, _dst_b, cpu->Y, _b)" in s
     assert "interp_bridge_lle_master_deadline_reached(cpu)" in s
     assert "interp_bridge_lle_yield_unwind(cpu, (((uint32)cpu->PB << 16) | 0x8e7au))" in s
     assert "cpu->X &= 0x00FFu" in s

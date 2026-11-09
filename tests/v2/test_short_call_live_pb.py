@@ -51,6 +51,11 @@ static uint8 ram[65536];
 static void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 value) {
     (void)cpu; assert(bank == 0); ram[addr] = value;
 }
+/* A direct JSR pushes its frame through the paced bus; the dispatch forms
+ * charge the instruction's transfers apart and write the frame unpaced. */
+static void cpu_write8_paced(CpuState *cpu, uint8 bank, uint16 addr, uint8 value) {
+    cpu_write8(cpu, bank, addr, value);
+}
 static uint16 cpu_read16(CpuState *cpu, uint8 bank, uint16 addr) {
     assert(bank == cpu->PB && addr == 0x8100); return 0x9000;
 }

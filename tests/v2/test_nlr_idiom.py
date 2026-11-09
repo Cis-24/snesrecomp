@@ -132,7 +132,7 @@ def test_single_pla_before_rts_keeps_literal_hardware_semantics():
     assert "RECOMP_RETURN_SKIP_1" not in src, (
         f"single PLA should not use a synthetic SKIP constant; src=\n{src}"
     )
-    assert "cpu_read8(cpu, 0x00, cpu->S);" in src, (
+    assert "cpu_read8_paced(cpu, 0x00, cpu->S);" in src, (
         f"literal PLA pop missing for non-NLR shape; src=\n{src}"
     )
 

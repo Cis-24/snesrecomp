@@ -47,9 +47,9 @@ def test_long_x_write_emits_24bit_effective_with_bank_carry():
     # Must emit a 24-bit effective with the bank carry.
     assert '(uint8)(' in src and ' >> 16' in src, src
     assert '0x7e2000' in src or '0x7E2000' in src, src
-    # The cpu_write16 call should reference the carried bank, not 0x7e
+    # The (paced) word write should reference the carried bank, not 0x7e
     # directly.
-    assert 'cpu_write16(cpu, (uint8)' in src, src
+    assert 'cpu_write16_paced(cpu, (uint8)' in src, src
 
 
 def test_abs_x_write_emits_24bit_effective_with_bank_carry():
@@ -69,10 +69,10 @@ def test_abs_x_write_emits_24bit_effective_with_bank_carry():
     src = emit_function(rom, bank=0, start=0x8000, entry_m=1, entry_x=1)
 
     # The broken DB-truncate form must be gone.
-    assert 'cpu_write16(cpu, cpu->DB, (uint16)(0xc800 + cpu->X)' not in src, src
+    assert 'cpu_write16_paced(cpu, cpu->DB, (uint16)(0xc800 + cpu->X)' not in src, src
     # 24-bit effective with carry-bearing bank.
     assert 'cpu->DB' in src and '<< 16' in src, src
-    assert 'cpu_write16(cpu, (uint8)' in src, src
+    assert 'cpu_write16_paced(cpu, (uint8)' in src, src
 
 
 def test_non_indexed_abs_keeps_cheap_form():
@@ -89,7 +89,7 @@ def test_non_indexed_abs_keeps_cheap_form():
     src = emit_function(rom, bank=0, start=0x8000, entry_m=1, entry_x=1)
 
     # Non-indexed ABS uses the simple form.
-    assert 'cpu_write8(cpu, cpu->DB, (uint16)(0xc800)' in src, src
+    assert 'cpu_write8_paced(cpu, cpu->DB, (uint16)(0xc800)' in src, src
     # Should NOT carry a 24-bit shift here (no index = no carry possible).
     assert 'cpu->DB << 16' not in src, src
 
@@ -109,8 +109,8 @@ def test_long_x_read_emits_24bit_effective_with_bank_carry():
     })
     src = emit_function(rom, bank=0, start=0x8000, entry_m=1, entry_x=1)
 
-    assert 'cpu_read16(cpu, 0x7e, (uint16)(0x2000 + cpu->X)' not in src, src
-    assert 'cpu_read16(cpu, (uint8)' in src, src
+    assert 'cpu_read16_paced(cpu, 0x7e, (uint16)(0x2000 + cpu->X)' not in src, src
+    assert 'cpu_read16_paced(cpu, (uint8)' in src, src
 
 
 def test_dp_indirect_long_y_read_carries_pointer_bank():
@@ -131,7 +131,8 @@ def test_dp_indirect_long_y_read_carries_pointer_bank():
     src = emit_function(rom, bank=0, start=0x8000, entry_m=1, entry_x=1)
 
     # Both bank and offset must derive from one 24-bit pointer-plus-Y
-    # expression; a bare pointer-bank argument is the pre-fix form.
-    assert 'cpu_read8(cpu, cpu_read8(cpu, 0x00' not in src, src
-    assert 'cpu_read8(cpu, (uint8)' in src, src
-    assert 'cpu->Y' in src and '<< 16' in src and '| (uint32)cpu_read16' in src, src
+    # expression; a bare pointer-bank argument is the pre-fix form. The
+    # pointer is read once into temporaries (lo/hi word, then bank).
+    assert 'cpu_read8_paced(cpu, _ib' not in src, src
+    assert 'cpu_read8_paced(cpu, (uint8)' in src, src
+    assert 'cpu->Y' in src and '<< 16' in src and '| (uint32)_ip' in src, src

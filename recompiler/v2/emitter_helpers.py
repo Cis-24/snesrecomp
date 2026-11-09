@@ -46,10 +46,13 @@ def runtime_code_speed(pc24: int):
 # push) and the stack frame ends up shifted by one byte. Symptom would
 # be an apparent off-by-one in subsequent PLA/PLB pulls.
 
+# The stack transfers are data cycles on hardware, so they go through the
+# paced accessors (bus time at the stack's address, cpu_state.h).
+
 def push_byte(val_expr: str) -> List[str]:
     """8-bit stack push: write at S, then decrement S."""
     return [
-        f"cpu_write8(cpu, 0x00, cpu->S, {val_expr});",
+        f"cpu_write8_paced(cpu, 0x00, cpu->S, {val_expr});",
         "cpu->S = (uint16)(cpu->S - 1);",
     ]
 
@@ -59,7 +62,7 @@ def push_word(val_expr: str) -> List[str]:
     After the push, the pushed word occupies S+1 (low) and S+2 (high)."""
     return [
         "cpu->S = (uint16)(cpu->S - 1);",
-        f"cpu_write16(cpu, 0x00, cpu->S, {val_expr});",
+        f"cpu_write16_paced(cpu, 0x00, cpu->S, {val_expr});",
         "cpu->S = (uint16)(cpu->S - 1);",
     ]
 
@@ -72,7 +75,7 @@ def pop_byte_assign(target_decl: str) -> List[str]:
     """
     return [
         "cpu->S = (uint16)(cpu->S + 1);",
-        f"{target_decl} = cpu_read8(cpu, 0x00, cpu->S);",
+        f"{target_decl} = cpu_read8_paced(cpu, 0x00, cpu->S);",
     ]
 
 
@@ -81,7 +84,7 @@ def pop_word_assign(target_decl: str) -> List[str]:
     increment S again."""
     return [
         "cpu->S = (uint16)(cpu->S + 1);",
-        f"{target_decl} = cpu_read16(cpu, 0x00, cpu->S);",
+        f"{target_decl} = cpu_read16_paced(cpu, 0x00, cpu->S);",
         "cpu->S = (uint16)(cpu->S + 1);",
     ]
 

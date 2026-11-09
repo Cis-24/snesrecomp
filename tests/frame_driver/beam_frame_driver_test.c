@@ -18,6 +18,7 @@
 #include "snes/snes.h"
 
 CpuState g_cpu;
+uint8_t g_memsel;
 Snes *g_snes;
 Ppu *g_ppu;
 bool g_fail;
@@ -74,6 +75,9 @@ static int s_steps;
 static bool s_poll_saw_flag;
 static int s_nmis;
 static uint32_t s_nmi_return;
+static uint32_t s_nmi_entry_pc;
+static uint64_t s_nmi_entry_master, s_nmi_entry_cycles;
+static uint64_t s_before_master, s_before_cycles;
 
 void interp_bridge_set_master_deadline(uint64_t master_clock) { s_deadline = master_clock; }
 uint32_t interp_bridge_lle_resume_pc(void) { return s_pc; }
@@ -113,7 +117,9 @@ int interp_bridge_run_until_quiescent(CpuState *cpu, uint32_t entry_pc24) {
 
 /* The handler acknowledges RDNMI first thing, as FF6's FieldNMI does. */
 int interp_bridge_run_interrupt(CpuState *cpu, uint32_t entry_pc24) {
-  (void)entry_pc24;
+  s_nmi_entry_pc = entry_pc24;
+  s_nmi_entry_master = cpu->master_cycles;
+  s_nmi_entry_cycles = cpu->cycles;
   s_nmis++;
   s_nmi_return = s_pc;
   s_snes.rdnmiPending = false;
@@ -134,6 +140,8 @@ static void run_nmi_frame(uint32_t park, bool rdnmi, bool nmi_enabled) {
   s_snes.rdnmiPending = false;
   s_park_at = park;
   snes_beam_frame_driver_run_frame();
+  s_before_master = g_cpu.master_cycles;
+  s_before_cycles = g_cpu.cycles;
 
   s_snes.nmiEnabled = nmi_enabled;
   s_snes.rdnmiPending = rdnmi;
@@ -203,6 +211,29 @@ static int test_rdnmi_poll_runs_before_nmi(void) {
   run_nmi_frame(POLL_LDA, true, false);
   failures += check(s_steps == 0 && s_nmis == 0, "NMI off: the poll just keeps running");
 
+  return failures;
+}
+
+/* Taking the NMI costs what the hardware (and the interpreter, interp816
+ * doInterrupt) charges: 2 internal cycles, four pushes and two vector reads,
+ * 8 CPU cycles, each bus transfer at the speed of its address. Here the stack
+ * is in WRAM and the vector in bank $00 ROM, both slow: 2*6 + 4*8 + 2*8. The
+ * frame driver once charged nothing for it, about 60 master clocks per NMI. */
+static int test_nmi_entry_is_charged(void) {
+  int failures = 0;
+  const uint16_t s_before = g_cpu.S;
+
+  run_nmi_frame(PLAIN_CODE, false, true);
+  failures += check(s_nmis == 1, "NMI delivered");
+  failures += check(s_nmi_entry_pc == 0x1500u, "the handler starts at the NMI vector");
+  failures += check(g_cpu.S == (uint16_t)(s_before - 4u), "the native interrupt frame is 4 bytes");
+  failures += check(s_nmi_entry_cycles - s_before_cycles == 8u,
+                    "interrupt entry: 8 CPU cycles");
+  failures += check(s_nmi_entry_master - s_before_master == 2u * 6u + 4u * 8u + 2u * 8u,
+                    "interrupt entry: 2 internal, 4 stack writes, 2 vector reads");
+  if (s_nmi_entry_master - s_before_master != 60u)
+    fprintf(stderr, "  entry charged %llu master clocks\n",
+            (unsigned long long)(s_nmi_entry_master - s_before_master));
   return failures;
 }
 
@@ -386,6 +417,7 @@ int main(void) {
   write_program();
 
   failures += test_rdnmi_poll_runs_before_nmi();
+  failures += test_nmi_entry_is_charged();
   failures += test_hdma_steps_from_line_zero();
   failures += test_hdma_armed_by_a_vblank_write();
   failures += test_hdma_mid_field_enable_keeps_its_delay();

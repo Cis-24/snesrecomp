@@ -348,23 +348,11 @@ static inline void cpu_pace_cycles_word(uint16 addr) {
 
 /* Master clocks for ONE bus access at a 24-bit address (region speed).
  * Mirrors Recompiler/snes_cycles.py::region_speed exactly. The LLE
- * (interp_bridge.c bridge_region_speed) and the AOT paced accessors below
- * share this single C implementation so both tiers price transfers
- * identically. */
+ * (interp_bridge.c bridge_region_speed) prices its transfers with it; the
+ * paced accessors of generated code use the same rule (cpu_bus_speed in
+ * cpu_state.h), so both tiers price transfers identically. */
 uint32_t cpu_region_speed(uint32_t adr) {
-    uint8_t bank = (uint8_t)(adr >> 16);
-    uint16_t a = (uint16_t)adr;
-    if (bank >= 0x40 && bank <= 0x7f) return 8;
-    if (bank >= 0xc0) return g_memsel ? 6 : 8;
-    if (a >= 0x8000) {
-        if (bank <= 0x3f) return 8;
-        return g_memsel ? 6 : 8;
-    }
-    if (a < 0x2000) return 8;
-    if (a < 0x4000) return 6;
-    if (a < 0x4200) return 12;
-    if (a < 0x6000) return 6;
-    return 8;
+    return cpu_bus_speed((uint8)(adr >> 16), (uint16)adr);
 }
 
 /* Optional debug — disabled in release. Set BUILD_CPU_HW_LOG=1 in the
@@ -742,77 +730,8 @@ void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
     cpu->open_bus = (uint8)(v >> 8);
 }
 
-/* ── Region-paced AOT bus (2026-08-31) ────────────────────────────────────
- * The LLE charges master clocks PER BUS TRANSFER at the region speed
- * (interp_bridge.c: master = Σ region_speed + internal×6). The AOT emitter's
- * block const covers fetch+internal cycles only; every data/stack/pointer
- * access in generated code calls these paced variants so the AOT master
- * advance matches the LLE exactly. The plain cpu_read8/16 / cpu_write8/16
- * stay UNPACED because the LLE's bridge shims call them inside their own
- * per-transfer accounting (pacing there would double-count the interp path).
- * The 16-bit forms charge both bytes at their own regions (they can straddle
- * a region boundary, e.g. $00:1FFF->$00:2000). */
-uint8_t cpu_read8_paced(CpuState *cpu, uint8_t bank, uint16_t addr) {
-    uint32_t _sp = cpu_region_speed(((uint32_t)bank << 16) | addr);
-    cpu->master_cycles += _sp;
-    {
-        static int _pl = -1;
-        if (_pl < 0) _pl = getenv("SNESRECOMP_PACELOG") ? 1 : 0;
-        if (_pl) {
-            extern int snes_frame_counter;
-            fprintf(stderr, "[pace] f=%d r8 b=$%02X a=$%04X sp=%u\n",
-                    snes_frame_counter, bank, addr, _sp);
-        }
-    }
-    return cpu_read8(cpu, bank, addr);
-}
-
-uint16_t cpu_read16_paced(CpuState *cpu, uint8_t bank, uint16_t addr) {
-    uint32_t _sp = cpu_region_speed(((uint32_t)bank << 16) | addr) +
-        cpu_region_speed(((uint32_t)bank << 16) | (uint16_t)(addr + 1));
-    cpu->master_cycles += _sp;
-    {
-        static int _pl = -1;
-        if (_pl < 0) _pl = getenv("SNESRECOMP_PACELOG") ? 1 : 0;
-        if (_pl) {
-            extern int snes_frame_counter;
-            fprintf(stderr, "[pace] f=%d r16 b=$%02X a=$%04X sp=%u\n",
-                    snes_frame_counter, bank, addr, _sp);
-        }
-    }
-    return cpu_read16(cpu, bank, addr);
-}
-
-void cpu_write8_paced(CpuState *cpu, uint8_t bank, uint16_t addr, uint8_t v) {
-    uint32_t _sp = cpu_region_speed(((uint32_t)bank << 16) | addr);
-    cpu->master_cycles += _sp;
-    {
-        static int _pl = -1;
-        if (_pl < 0) _pl = getenv("SNESRECOMP_PACELOG") ? 1 : 0;
-        if (_pl) {
-            extern int snes_frame_counter;
-            fprintf(stderr, "[pace] f=%d w8 b=$%02X a=$%04X sp=%u\n",
-                    snes_frame_counter, bank, addr, _sp);
-        }
-    }
-    cpu_write8(cpu, bank, addr, v);
-}
-
-void cpu_write16_paced(CpuState *cpu, uint8_t bank, uint16_t addr, uint16_t v) {
-    uint32_t _sp = cpu_region_speed(((uint32_t)bank << 16) | addr) +
-        cpu_region_speed(((uint32_t)bank << 16) | (uint16_t)(addr + 1));
-    cpu->master_cycles += _sp;
-    {
-        static int _pl = -1;
-        if (_pl < 0) _pl = getenv("SNESRECOMP_PACELOG") ? 1 : 0;
-        if (_pl) {
-            extern int snes_frame_counter;
-            fprintf(stderr, "[pace] f=%d w16 b=$%02X a=$%04X sp=%u\n",
-                    snes_frame_counter, bank, addr, _sp);
-        }
-    }
-    cpu_write16(cpu, bank, addr, v);
-}
+/* The region-paced accessors for generated code (cpu_read8_paced etc.) are
+ * static inline in cpu_state.h, next to g_memsel. */
 
 /* ── PEI-trampoline dispatch helper (2026-05-24, narrow detector) ──────
  *

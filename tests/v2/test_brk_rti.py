@@ -51,8 +51,8 @@ def test_round_trip_is_compiled_and_falls_through():
                         end=0x8007, func_name='Fill', brk_rti_sites={0x008002})
     assert 'BRK to a bare RTI' in src
     # the four bytes the interrupt pushes: PB, $8004 (past the signature), P
-    assert 'cpu_write8(cpu, 0x00, (uint16)(_s - 1), 0x80);' in src
-    assert 'cpu_write8(cpu, 0x00, (uint16)(_s - 2), 0x04);' in src
+    assert 'cpu_write8_paced(cpu, 0x00, (uint16)(_s - 1), 0x80);' in src
+    assert 'cpu_write8_paced(cpu, 0x00, (uint16)(_s - 2), 0x04);' in src
     # ... and the code after it is compiled
     assert 'cpu->D + 0x0010' in src
     assert src.index('BRK to a bare RTI') < src.index('cpu->D + 0x0010')
@@ -145,12 +145,19 @@ _MAIN = r'''
 int interp816_opcode_hook(uint32_t addr) { (void)addr; return 0; }
 
 static uint8 g_mem_ram[0x10000];
+/* The interpreter's time, priced as interp_bridge.c does: every bus
+ * transfer at the speed of its address, the remaining cycles at 6. */
+static uint64 g_bus_master, g_bus_transfers;
+static void bus_price(uint32_t adr) {
+  g_bus_master += cpu_bus_speed((uint8)(adr >> 16), (uint16)adr);
+  g_bus_transfers++;
+}
 static uint8_t bus_read(void *m, uint32_t adr) {
-  (void)m; adr &= 0xFFFF;
+  (void)m; bus_price(adr); adr &= 0xFFFF;
   return adr >= 0x8000 ? g_rom[adr - 0x8000] : g_mem_ram[adr];
 }
 static void bus_write(void *m, uint32_t adr, uint8_t v) {
-  (void)m; adr &= 0xFFFF;
+  (void)m; bus_price(adr); adr &= 0xFFFF;
   if (adr < 0x8000) g_mem_ram[adr] = v;
 }
 
@@ -160,7 +167,7 @@ static const char *scenario;
     __FILE__, __LINE__, scenario, #c); fails++; } } while (0)
 
 typedef struct {
-  uint8 p, pb; uint16 s; uint8 stack[4]; uint8 zp[2]; uint64 cycles;
+  uint8 p, pb; uint16 s; uint8 stack[4]; uint8 zp[2]; uint64 cycles, master;
 } Outcome;
 
 static void compiled(RecompReturn (*fn)(CpuState *), uint8 p, Outcome *o) {
@@ -178,7 +185,7 @@ static void compiled(RecompReturn (*fn)(CpuState *), uint8 p, Outcome *o) {
   memcpy(o->stack, &g_ram[0x01FA], 4);
   memcpy(o->zp, &g_ram[0x40], 2);
   o->cycles = cpu.cycles;
-  CHECK(cpu.master_cycles == cpu.cycles * 8);  /* all of it in bank $00 */
+  o->master = cpu.master_cycles;
   CHECK(g_other_exits == 0);
 }
 
@@ -192,6 +199,7 @@ static void interpreted(uint8 p, Outcome *o) {
   cpu->dp = 0; cpu->db = 0;
   interp816_setFlags(cpu, p);
   uint64 cycles = 0;
+  g_bus_master = g_bus_transfers = 0;
   cycles += (uint64)interp816_runOpcode(cpu);         /* BRK */
   CHECK(cpu->k == 0 && cpu->pc == 0x9000);
   CHECK(cpu->sp == 0x01F9);
@@ -206,6 +214,7 @@ static void interpreted(uint8 p, Outcome *o) {
   memcpy(o->stack, &g_mem_ram[0x01FA], 4);
   memcpy(o->zp, &g_mem_ram[0x40], 2);
   o->cycles = cycles;
+  o->master = g_bus_master + (cycles - g_bus_transfers) * 6u;
   interp816_free(cpu);
 }
 
@@ -224,6 +233,12 @@ static void same(RecompReturn (*fn)(CpuState *), uint8 p) {
   if (c.cycles != i.cycles)
     fprintf(stderr, "  compiled %llu, interpreted %llu cycles\n",
             (unsigned long long)c.cycles, (unsigned long long)i.cycles);
+  /* Bus-accurate time: the compiled round trip prices every transfer at
+   * its region, like the interpreter (bank $00 ROM and WRAM, all slow). */
+  CHECK(c.master == i.master);
+  if (c.master != i.master)
+    fprintf(stderr, "  compiled %llu, interpreted %llu master clocks\n",
+            (unsigned long long)c.master, (unsigned long long)i.master);
 }
 
 int main(void) {
