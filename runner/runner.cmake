@@ -400,6 +400,24 @@ if(SNESRECOMP_ENABLE_TRACE)
         )
     endif()
 endif()
+# Frames kept by the debug server's frame history (debug_server.c). Each record
+# holds a WRAM and VRAM copy (about 200 KB) in static storage, so the default of
+# 6000 frames is 1.2 GB of image; with the trace rings a Windows trace build
+# passed the 2 GB image limit and did not start. Empty keeps the default.
+set(SNESRECOMP_FRAME_HISTORY_SIZE "" CACHE STRING
+    "Trace build: frames in the debug server's frame history (empty = 6000)")
+if(SNESRECOMP_ENABLE_TRACE AND NOT SNESRECOMP_FRAME_HISTORY_SIZE STREQUAL "")
+    if(NOT SNESRECOMP_FRAME_HISTORY_SIZE MATCHES "^[1-9][0-9]*$")
+        message(FATAL_ERROR
+            "SNESRECOMP_FRAME_HISTORY_SIZE must be a positive integer, "
+            "got '${SNESRECOMP_FRAME_HISTORY_SIZE}'")
+    endif()
+    add_compile_definitions(
+        SNESRECOMP_FRAME_HISTORY_SIZE=${SNESRECOMP_FRAME_HISTORY_SIZE})
+    message(STATUS
+        "snesrecomp: debug server frame history = "
+        "${SNESRECOMP_FRAME_HISTORY_SIZE} frames")
+endif()
 
 # Schema-driven mod packages and trusted static plugins. This is deliberately
 # opt-in: ordinary games do not compile the loader, expose a Mods navigation

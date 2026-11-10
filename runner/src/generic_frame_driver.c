@@ -52,6 +52,8 @@ static uint32_t irq_vector(void)   { return read_vector(0x00FFEEu); }
  * terminal RTI returns into that instruction stream. */
 static void run_interrupt(uint32_t vector, uint64_t frame_end) {
     cpu_push_interrupt_frame_at(&g_cpu, s_resume_pc);
+    /* The handler runs with I set and D clear; its RTI restores the pushed P. */
+    cpu_enter_interrupt_flags(&g_cpu);
     interp_bridge_set_master_deadline(frame_end);
     (void)interp_bridge_run_interrupt(&g_cpu, vector);
     /* Clearing matters: a deadline left armed stays true for every AOT block
@@ -145,6 +147,7 @@ void snes_generic_frame_driver_draw_ppu_frame(void) {
         if (line == trigger) {
             g_snes->inIrq = true;
             cpu_push_interrupt_frame_at(&g_cpu, s_resume_pc);
+            cpu_enter_interrupt_flags(&g_cpu);
             (void)interp_bridge_run_interrupt(&g_cpu, irq_vector());
             g_snes->inIrq = false;
             {

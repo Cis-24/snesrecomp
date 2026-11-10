@@ -150,6 +150,10 @@ static void run_interrupt(uint32_t vector_addr, uint64_t deadline) {
    * already starts where the real CPU would take it. */
   const uint32_t vector = read_vector(vector_addr);
   cpu_push_interrupt_frame_at(&g_cpu, s_resume_pc);
+  /* The handler runs with I set and D clear, as on hardware. Left as the
+   * interrupted code had them, FF6's CutsceneNMI pushed P = $A1 where the
+   * reference pushed $A5, and an IRQ could nest inside its own handler. */
+  cpu_enter_interrupt_flags(&g_cpu);
   charge_interrupt_entry(vector_addr);
   interp_bridge_set_master_deadline(deadline);
   (void)interp_bridge_run_interrupt(&g_cpu, vector);

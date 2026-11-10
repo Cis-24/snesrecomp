@@ -769,6 +769,7 @@ void recomp_post_mortem_dump(const char *reason, void *fault_info) {
      * engine did last. They were in SuperMetroidRecomp's fork only. */
     RecompStackBalDumpJson(f);
     CpuUnresolvedAbandonDumpJson(f);
+    CpuDispatchOobDumpJson(f);
     CpuDispatchLogDumpJson(f);
     ppudma_dump_json(f);
     /* How much guest execution the interpreter carried since boot. Always-on

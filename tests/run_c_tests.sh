@@ -165,6 +165,15 @@ echo "=== beam frame driver ==="
     -lm -o "$OUT/beam_frame_driver_test"
 "$OUT/beam_frame_driver_test"
 
+echo "=== generic frame driver: interrupt entry ==="
+"$CC" -std=c11 -Wall -Wextra -O1 \
+    -DSNESRECOMP_REVERSE_DEBUG=0 \
+    -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes" \
+    "$ROOT/tests/frame_driver/generic_frame_driver_test.c" \
+    "$ROOT/runner/src/generic_frame_driver.c" \
+    -o "$OUT/generic_frame_driver_test"
+"$OUT/generic_frame_driver_test"
+
 echo "=== codegen vs interp816 (semantics, cycles, bus-priced master clocks) ==="
 "${PYTHON:-python3}" "$ROOT/tests/cpu_diff/gen_ops.py" "$OUT/cpu_diff_gen_ops.c"
 "$CC" -std=c11 -O1 -w \
@@ -328,6 +337,18 @@ echo "=== production diagnostic gates ==="
     "$ROOT/runner/src/common_cpu_infra.c" \
     $GC_SECTIONS_LINKER -o "$OUT/diagnostic_gates_test"
 "$OUT/diagnostic_gates_test"
+
+echo "=== dispatch value missing from a generated switch (production build) ==="
+"$CC" -std=c11 -Wall -Wextra -Werror \
+    -ffunction-sections -fdata-sections \
+    -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes" \
+    "$ROOT/tests/runtime_dispatch/dispatch_oob_test.c" \
+    "$ROOT/runner/src/common_cpu_infra.c" \
+    $GC_SECTIONS_LINKER -o "$OUT/dispatch_oob_test"
+"$OUT/dispatch_oob_test" "$OUT/dispatch_oob_test.stderr.txt"
+
+echo "=== debug server frame history size (trace build) ==="
+bash "$ROOT/tests/debug_server/frame_history_size_test.sh" "$ROOT" "$OUT"
 
 echo "=== rollback state digest ==="
 "$CC" -std=c11 -Wall -Wextra -Werror -O1 \

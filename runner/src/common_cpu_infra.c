@@ -289,6 +289,81 @@ void CpuUnresolvedAbandonDumpJson(FILE *f) {
   fprintf(f, "\n    ]\n  },\n");
 }
 
+/* ── Dispatch value missing from a generated switch: ALWAYS-ON accounting ──
+ * The default arm of a generated dispatch switch calls cpu_trace_dispatch_oob,
+ * which lands here in every configuration (cpu_trace.h). Whatever the arm does
+ * next (interpreter tier, balanced abandon, or for a call-form dispatch without
+ * a live pointer a plain fall-through that skips the handler), the site is a
+ * worklist item: its target is missing from the generated code. Bounded
+ * per-site table; first hit per site emits one stderr line; the post-mortem
+ * report dumps the whole table. Before, a build without SNESRECOMP_TRACE
+ * dropped such a call without any record (FF6's wound handler at $C24600,
+ * missing from `jsr (SetStatusTbl,x)`). */
+#define DISPATCH_OOB_MAX 256
+typedef struct DispatchOobSite {
+  uint32_t site_pc24;
+  uint64_t hits;
+  int32_t first_frame;
+  int32_t last_frame;
+  uint32_t first_value;
+  uint32_t last_value;
+} DispatchOobSite;
+static DispatchOobSite g_dispatch_oob[DISPATCH_OOB_MAX];
+static int g_dispatch_oob_count;
+static uint64_t g_dispatch_oob_total;
+static uint64_t g_dispatch_oob_overflow;
+
+void cpu_dispatch_oob_note(uint32_t site_pc24, uint32_t value) {
+  extern int snes_frame_counter;
+  int i;
+  site_pc24 &= 0xFFFFFFu;
+  value &= 0xFFFFFFu;
+  g_dispatch_oob_total++;
+  for (i = 0; i < g_dispatch_oob_count; i++) {
+    if (g_dispatch_oob[i].site_pc24 == site_pc24) break;
+  }
+  if (i == g_dispatch_oob_count) {
+    if (i == DISPATCH_OOB_MAX) {
+      g_dispatch_oob_overflow++;
+      return;
+    }
+    g_dispatch_oob_count++;
+    g_dispatch_oob[i].site_pc24 = site_pc24;
+    g_dispatch_oob[i].hits = 0;
+    g_dispatch_oob[i].first_frame = snes_frame_counter;
+    g_dispatch_oob[i].first_value = value;
+    fprintf(stderr,
+            "[dispatch-oob] first hit site=$%06X value=$%06X frame=%d "
+            "(target missing from the generated dispatch; without an "
+            "interpreter fallback the handler is SKIPPED: authorize it)\n",
+            (unsigned)site_pc24, (unsigned)value, snes_frame_counter);
+  }
+  g_dispatch_oob[i].hits++;
+  g_dispatch_oob[i].last_frame = snes_frame_counter;
+  g_dispatch_oob[i].last_value = value;
+}
+
+void CpuDispatchOobDumpJson(FILE *f) {
+  fprintf(f, "  \"dispatch_oob\": {\n"
+             "    \"total_hits\": %llu,\n"
+             "    \"distinct_sites\": %d,\n"
+             "    \"overflowed_hits\": %llu,\n"
+             "    \"sites\": [",
+          (unsigned long long)g_dispatch_oob_total,
+          g_dispatch_oob_count,
+          (unsigned long long)g_dispatch_oob_overflow);
+  for (int i = 0; i < g_dispatch_oob_count; i++) {
+    const DispatchOobSite *s = &g_dispatch_oob[i];
+    fprintf(f, "%s\n      {\"site\": \"0x%06X\", \"hits\": %llu, "
+               "\"first_frame\": %d, \"last_frame\": %d, "
+               "\"first_value\": \"0x%06X\", \"last_value\": \"0x%06X\"}",
+            i ? "," : "", (unsigned)s->site_pc24,
+            (unsigned long long)s->hits, s->first_frame, s->last_frame,
+            (unsigned)s->first_value, (unsigned)s->last_value);
+  }
+  fprintf(f, "\n    ]\n  },\n");
+}
+
 /* Convert a matched ancestor's frame INDEX into the SKIP_N unwind depth the
  * generated return contract expects.
  *

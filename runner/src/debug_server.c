@@ -1397,7 +1397,19 @@ void debug_server_profile_latch(int frame_num) {
 // smaller big-state ring). The small-state ring still holds ~100s
 // of every-frame CPU/PPU/DMA/CGRAM/OAM/zeropage/wram_1000 without
 // the 196KB/frame adds.
-#define FRAME_HISTORY_SIZE 6000
+//
+// The ring is static, so it counts toward the executable image. With the
+// trace rings a Windows image passed the 2 GB limit at 6000 frames and no
+// longer loaded ("not a valid Win32 application"). A game sets a smaller ring
+// with the CMake cache variable SNESRECOMP_FRAME_HISTORY_SIZE (runner.cmake),
+// which defines the macro of the same name.
+#ifndef SNESRECOMP_FRAME_HISTORY_SIZE
+#define SNESRECOMP_FRAME_HISTORY_SIZE 6000
+#endif
+#if SNESRECOMP_FRAME_HISTORY_SIZE < 1
+#error "SNESRECOMP_FRAME_HISTORY_SIZE must be at least 1"
+#endif
+#define FRAME_HISTORY_SIZE SNESRECOMP_FRAME_HISTORY_SIZE
 
 // Key RAM addresses snapshotted each frame (must match oracle debug_server.c)
 #define SNAP_BYTES 64

@@ -78,6 +78,8 @@ static uint32_t s_nmi_return;
 static uint32_t s_nmi_entry_pc;
 static uint64_t s_nmi_entry_master, s_nmi_entry_cycles;
 static uint64_t s_before_master, s_before_cycles;
+/* What the handler finds on entry: its own flags and the pushed P. */
+static uint8_t s_entry_flag_i, s_entry_flag_d, s_entry_p, s_entry_pushed_p;
 
 void interp_bridge_set_master_deadline(uint64_t master_clock) { s_deadline = master_clock; }
 uint32_t interp_bridge_lle_resume_pc(void) { return s_pc; }
@@ -115,14 +117,20 @@ int interp_bridge_run_until_quiescent(CpuState *cpu, uint32_t entry_pc24) {
   return 0;
 }
 
-/* The handler acknowledges RDNMI first thing, as FF6's FieldNMI does. */
+/* The handler acknowledges RDNMI first thing, as FF6's FieldNMI does, and an
+ * IRQ handler acknowledges its line. */
 int interp_bridge_run_interrupt(CpuState *cpu, uint32_t entry_pc24) {
   s_nmi_entry_pc = entry_pc24;
   s_nmi_entry_master = cpu->master_cycles;
   s_nmi_entry_cycles = cpu->cycles;
+  s_entry_flag_i = cpu->_flag_I;
+  s_entry_flag_d = cpu->_flag_D;
+  s_entry_p = cpu->P;
+  s_entry_pushed_p = s_bus[(uint16_t)(cpu->S + 1u)];
   s_nmis++;
   s_nmi_return = s_pc;
   s_snes.rdnmiPending = false;
+  s_snes.inIrq = false;
   cpu->master_cycles += 100;
   return 0;
 }
@@ -172,6 +180,7 @@ static void write_program(void) {
   s_bus[PLAIN_CODE] = 0xEA;
   s_bus[0xFFFC] = 0x00; s_bus[0xFFFD] = 0x80; /* reset */
   s_bus[0xFFEA] = 0x00; s_bus[0xFFEB] = 0x15; /* NMI */
+  s_bus[0xFFEE] = 0x04; s_bus[0xFFEF] = 0x15; /* IRQ */
 }
 
 /* RDNMI rises a moment before the CPU takes the NMI. Parked at that boundary, a
@@ -234,6 +243,70 @@ static int test_nmi_entry_is_charged(void) {
   if (s_nmi_entry_master - s_before_master != 60u)
     fprintf(stderr, "  entry charged %llu master clocks\n",
             (unsigned long long)(s_nmi_entry_master - s_before_master));
+  return failures;
+}
+
+/* The interrupted code runs with I clear and D set (N, M, X and C set too). */
+#define INTERRUPTED_P 0xB9u
+
+static void set_interrupted_flags(void) {
+  g_cpu.emulation = 0;
+  g_cpu.P = INTERRUPTED_P;
+  cpu_p_to_mirrors(&g_cpu);
+}
+
+/* Taking an interrupt pushes P as it was, then sets I and clears D, as the
+ * hardware and interp816 doInterrupt do. The handler runs with IRQs masked and
+ * in binary mode; its RTI restores the pushed flags. The frame driver once left
+ * both as the interrupted code had them: FF6's CutsceneNMI pushed P = $A1 where
+ * the reference pushed $A5, and an IRQ could nest inside its own handler. */
+static int check_interrupt_entry_flags(const char *what) {
+  int failures = 0;
+  char msg[160];
+  snprintf(msg, sizeof msg, "%s: the handler runs with I set", what);
+  failures += check(s_entry_flag_i == 1, msg);
+  snprintf(msg, sizeof msg, "%s: the handler runs with D clear", what);
+  failures += check(s_entry_flag_d == 0, msg);
+  snprintf(msg, sizeof msg, "%s: P agrees with the flag mirrors", what);
+  failures += check(s_entry_p == ((INTERRUPTED_P | 0x04u) & ~0x08u), msg);
+  snprintf(msg, sizeof msg, "%s: the pushed P is the interrupted code's", what);
+  failures += check(s_entry_pushed_p == INTERRUPTED_P, msg);
+  if (failures)
+    fprintf(stderr, "  %s entry: I=%u D=%u P=$%02X pushed P=$%02X\n", what,
+            s_entry_flag_i, s_entry_flag_d, s_entry_p, s_entry_pushed_p);
+  return failures;
+}
+
+static int test_interrupt_entry_sets_i_and_clears_d(void) {
+  int failures = 0;
+
+  /* NMI at the start of the field. */
+  snes_beam_frame_driver_reset();
+  s_snes.nmiEnabled = false;
+  s_snes.rdnmiPending = false;
+  s_snes.inIrq = false;
+  s_park_at = PLAIN_CODE;
+  snes_beam_frame_driver_run_frame();
+  set_interrupted_flags();
+  s_snes.nmiEnabled = true;
+  s_nmis = 0;
+  snes_beam_frame_driver_run_frame();
+  failures += check(s_nmis == 1 && s_nmi_entry_pc == 0x1500u, "NMI delivered");
+  failures += check_interrupt_entry_flags("NMI");
+
+  /* IRQ inside the field, with NMI off. */
+  snes_beam_frame_driver_reset();
+  s_snes.nmiEnabled = false;
+  s_snes.inIrq = false;
+  s_park_at = PLAIN_CODE;
+  snes_beam_frame_driver_run_frame();
+  set_interrupted_flags();
+  s_snes.inIrq = true;
+  s_nmis = 0;
+  snes_beam_frame_driver_run_frame();
+  failures += check(s_nmis == 1 && s_nmi_entry_pc == 0x1504u, "IRQ delivered once");
+  failures += check_interrupt_entry_flags("IRQ");
+  s_snes.inIrq = false;
   return failures;
 }
 
@@ -418,6 +491,7 @@ int main(void) {
 
   failures += test_rdnmi_poll_runs_before_nmi();
   failures += test_nmi_entry_is_charged();
+  failures += test_interrupt_entry_sets_i_and_clears_d();
   failures += test_hdma_steps_from_line_zero();
   failures += test_hdma_armed_by_a_vblank_write();
   failures += test_hdma_mid_field_enable_keeps_its_delay();

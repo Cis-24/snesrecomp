@@ -1359,9 +1359,11 @@ static inline RecompReturn cpu_trace_unresolved_stub_trap(
     (void)c; (void)t; (void)fn;
     return RECOMP_RETURN_NORMAL;
 }
+/* Not a no-op: the always-on accounting still sees the miss (cpu_state.h). */
 static inline RecompReturn cpu_trace_dispatch_oob(
     CpuState *c, uint32_t s, uint32_t v) {
-    (void)c; (void)s; (void)v;
+    (void)c;
+    cpu_dispatch_oob_note(s, v);
     return RECOMP_RETURN_NORMAL;
 }
 

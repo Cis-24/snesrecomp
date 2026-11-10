@@ -447,6 +447,16 @@ static inline void cpu_push_interrupt_frame_at(CpuState *cpu, uint32 pc24) {
     cpu_write8(cpu, 0x00, cpu->S, cpu->P); cpu->S = (uint16)(cpu->S - 1);
 }
 
+/* After the interrupt frame is pushed, the 65816 sets I and clears D before
+ * it reads the vector (both modes), as interp816 doInterrupt does. The handler
+ * runs with IRQs masked and in binary mode; its RTI restores the pushed P.
+ * Frame drivers call this right after cpu_push_interrupt_frame_at. */
+static inline void cpu_enter_interrupt_flags(CpuState *cpu) {
+    cpu->_flag_I = 1;
+    cpu->_flag_D = 0;
+    cpu->P = (uint8)((cpu->P | CPU_P_I) & ~CPU_P_D);
+}
+
 /* Generated host-C control flow has no runtime PC offset. Its generated RTI
  * pops this frame and returns through C, so the bank value and live P are the
  * only meaningful fields in this wrapper. */
@@ -723,6 +733,16 @@ int cpu_aot_rom_mapping_matches(uint32 pc24, uint32 rom_offset, unsigned length)
  * when SNESRECOMP_TRACE is on. */
 RecompReturn cpu_unresolved_abandon_balanced(CpuState *cpu, uint32 site_pc24,
                                              uint16 entry_s, uint8 hrv);
+
+/* A dispatch value missing from a generated switch (the default arm's
+ * cpu_trace_dispatch_oob call). Always compiled, in common_cpu_infra.c: an
+ * ALWAYS-ON per-site table (first hit per site -> one "[dispatch-oob]" stderr
+ * line; full table -> post-mortem JSON via CpuDispatchOobDumpJson). The arm
+ * then runs the live target on the interpreter tier, abandons balanced, or,
+ * for a call-form dispatch without a live pointer, unpops the call frame and
+ * falls through: that handler never runs. In a build without
+ * SNESRECOMP_TRACE such a skip used to leave no trace at all. */
+void cpu_dispatch_oob_note(uint32 site_pc24, uint32 value);
 
 /* Interpreter-fallback tier (interp_bridge.c). Interpret the guest routine at
  * target_pc24 sharing this CpuState — bouncing sub-calls into compiled code —

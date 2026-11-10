@@ -1829,6 +1829,8 @@ RecompReturn cpu_trace_dispatch_oob(
     CpuState *cpu, uint32_t site_pc24, uint32_t value)
 {
     char name[64];
+    /* The always-on accounting first, as in a build without the trace. */
+    cpu_dispatch_oob_note(site_pc24, value);
     snprintf(name, sizeof(name), "dispatch_oob_$%06X[%06X]",
              (unsigned)(site_pc24 & 0xFFFFFFu),
              (unsigned)(value & 0xFFFFFFu));
